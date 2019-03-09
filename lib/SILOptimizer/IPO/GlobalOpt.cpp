@@ -11,9 +11,13 @@
 //===----------------------------------------------------------------------===//
 
 #define DEBUG_TYPE "globalopt"
+#include "swift/AST/ASTMangler.h"
 #include "swift/Demangling/Demangle.h"
+#include "swift/Demangling/Demangler.h"
+#include "swift/Demangling/ManglingMacros.h"
 #include "swift/SIL/CFG.h"
 #include "swift/SIL/DebugUtils.h"
+#include "swift/SILOptimizer/Utils/SILOptFunctionBuilder.h"
 #include "swift/SIL/SILGlobalVariable.h"
 #include "swift/SIL/SILInstruction.h"
 #include "swift/SILOptimizer/Analysis/ColdBlockInfo.h"
@@ -21,13 +25,10 @@
 #include "swift/SILOptimizer/PassManager/Passes.h"
 #include "swift/SILOptimizer/PassManager/Transforms.h"
 #include "swift/SILOptimizer/Utils/Local.h"
-#include "swift/Demangling/Demangler.h"
-#include "swift/Demangling/ManglingMacros.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/SCCIterator.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
-#include "swift/AST/ASTMangler.h"
 
 using namespace swift;
 
@@ -49,6 +50,7 @@ namespace {
 /// - When the addressor is local to the module, be sure it is inlined to allow
 ///   constant propagation in case of statically initialized "lets".
 class SILGlobalOpt {
+  SILOptFunctionBuilder &FunctionBuilder;
   SILModule *Module;
   DominanceAnalysis *DA;
   bool HasChanged = false;
@@ -94,8 +96,8 @@ class SILGlobalOpt {
   /// function.
   llvm::DenseMap<SILFunction *, unsigned> InitializerCount;
 public:
-  SILGlobalOpt(SILModule *M, DominanceAnalysis *DA)
-      : Module(M), DA(DA) {}
+  SILGlobalOpt(SILOptFunctionBuilder &FunctionBuilder, SILModule *M, DominanceAnalysis *DA)
+      : FunctionBuilder(FunctionBuilder), Module(M), DA(DA) {}
 
   bool run();
 
@@ -173,8 +175,8 @@ public:
 
   SILBasicBlock *remapBasicBlock(SILBasicBlock *BB) { return BB; }
 
-  SILValue remapValue(SILValue Value) {
-    return SILCloner<InstructionsCloner>::remapValue(Value);
+  SILValue getMappedValue(SILValue Value) {
+    return SILCloner<InstructionsCloner>::getMappedValue(Value);
   }
 
   void postProcess(SILInstruction *Orig, SILInstruction *Cloned) {
@@ -198,7 +200,7 @@ public:
 // If this is a call to a global initializer, map it.
 void SILGlobalOpt::collectGlobalInitCall(ApplyInst *AI) {
   SILFunction *F = AI->getReferencedFunction();
-  if (!F || !F->isGlobalInit())
+  if (!F || !F->isGlobalInit() || !ApplySite(AI).canOptimize())
     return;
 
   GlobalInitCallMap[F].push_back(AI);
@@ -241,26 +243,29 @@ static std::string mangleGetter(VarDecl *varDecl) {
   return Mangler.mangleGlobalGetterEntity(varDecl);
 }
 
-static SILFunction *getGlobalGetterFunction(SILModule &M,
+static SILFunction *getGlobalGetterFunction(SILOptFunctionBuilder &FunctionBuilder,
+                                            SILModule &M,
                                             SILLocation loc,
                                             VarDecl *varDecl) {
-  auto getterName = mangleGetter(varDecl);
+  auto getterNameTmp = mangleGetter(varDecl);
 
   // Check if a getter was generated already.
-  if (auto *F = M.lookUpFunction(getterName))
+  if (auto *F = M.lookUpFunction(getterNameTmp))
     return F;
 
-  auto Linkage = (varDecl->getEffectiveAccess() >= AccessLevel::Public
-                  ? SILLinkage::PublicNonABI
-                  : SILLinkage::Private);
-  auto Serialized = (varDecl->getEffectiveAccess() >= AccessLevel::Public
-                     ? IsSerialized
-                     : IsNotSerialized);
+  auto Linkage = SILLinkage::Private;
+  auto Serialized = IsNotSerialized;
 
-  auto refType = M.Types.getLoweredType(varDecl->getInterfaceType());
+  if (varDecl->getEffectiveAccess() >= AccessLevel::Public &&
+      !varDecl->isResilient()) {
+    Linkage = SILLinkage::PublicNonABI;
+    Serialized = IsSerialized;
+  }
+
+  auto refType = M.Types.getLoweredRValueType(varDecl->getInterfaceType());
 
   // Function takes no arguments and returns refType
-  SILResultInfo Results[] = { SILResultInfo(refType.getASTType(),
+  SILResultInfo Results[] = { SILResultInfo(refType,
                                             ResultConvention::Owned) };
   SILFunctionType::ExtInfo EInfo;
   EInfo = EInfo.withRepresentation(SILFunctionType::Representation::Thin);
@@ -270,15 +275,16 @@ static SILFunction *getGlobalGetterFunction(SILModule &M,
                          ParameterConvention::Direct_Unowned,
                          /*params*/ {}, /*yields*/ {}, Results, None,
                          M.getASTContext());
-
-  return M.getOrCreateFunction(
-      loc, getterName, Linkage, LoweredType,
-      IsBare, IsNotTransparent, Serialized);
+  auto getterName = M.allocateCopy(getterNameTmp);
+  return FunctionBuilder.getOrCreateFunction(
+      loc, getterName, Linkage, LoweredType, IsBare, IsNotTransparent,
+      Serialized, IsNotDynamic);
 }
 
 /// Generate getter from the initialization code whose result is stored by a
 /// given store instruction.
-static SILFunction *genGetterFromInit(StoreInst *Store,
+static SILFunction *genGetterFromInit(SILOptFunctionBuilder &FunctionBuilder,
+                                      StoreInst *Store,
                                       SILGlobalVariable *SILG) {
   auto *varDecl = SILG->getDecl();
 
@@ -288,21 +294,19 @@ static SILFunction *genGetterFromInit(StoreInst *Store,
   auto V = Store->getSrc();
 
   SmallVector<SILInstruction *, 8> Insts;
-  Insts.push_back(Store);
-  Insts.push_back(cast<SingleValueInstruction>(Store->getDest()));
   if (!analyzeStaticInitializer(V, Insts))
     return nullptr;
+  Insts.push_back(cast<SingleValueInstruction>(Store->getDest()));
+  Insts.push_back(Store);
 
-  // Produce a correct order of instructions.
-  std::reverse(Insts.begin(), Insts.end());
-
-  auto *GetterF = getGlobalGetterFunction(Store->getModule(),
+  auto *GetterF = getGlobalGetterFunction(FunctionBuilder,
+                                          Store->getModule(),
                                           Store->getLoc(),
                                           varDecl);
 
   GetterF->setDebugScope(Store->getFunction()->getDebugScope());
-  if (!Store->getFunction()->hasQualifiedOwnership())
-    GetterF->setUnqualifiedOwnership();
+  if (!Store->getFunction()->hasOwnership())
+    GetterF->setOwnershipEliminated();
   auto *EntryBB = GetterF->createBasicBlock();
 
   // Copy instructions into GetterF
@@ -360,7 +364,7 @@ void SILGlobalOpt::collectOnceCall(BuiltinInst *BI) {
 
   SILFunction *Callee = getCalleeOfOnceCall(BI);
   if (!Callee) {
-    DEBUG(llvm::dbgs() << "GlobalOpt: unhandled once callee\n");
+    LLVM_DEBUG(llvm::dbgs() << "GlobalOpt: unhandled once callee\n");
     UnhandledOnceCallee = true;
     return;
   }
@@ -481,9 +485,9 @@ ApplyInst *SILGlobalOpt::getHoistedApplyForInitializer(
 /// a single dominating call in the outer loop preheader.
 void SILGlobalOpt::placeInitializers(SILFunction *InitF,
                                      ArrayRef<ApplyInst *> Calls) {
-  DEBUG(llvm::dbgs() << "GlobalOpt: calls to "
-        << Demangle::demangleSymbolAsString(InitF->getName())
-        << " : " << Calls.size() << "\n");
+  LLVM_DEBUG(llvm::dbgs() << "GlobalOpt: calls to "
+             << Demangle::demangleSymbolAsString(InitF->getName())
+             << " : " << Calls.size() << "\n");
   // Map each initializer-containing function to its final initializer call.
   llvm::DenseMap<SILFunction *, ApplyInst *> ParentFuncs;
   for (auto *AI : Calls) {
@@ -507,8 +511,9 @@ void SILGlobalOpt::placeInitializers(SILFunction *InitF,
     while (Node) {
       SILBasicBlock *DomParentBB = Node->getBlock();
       if (isAvailabilityCheck(DomParentBB)) {
-        DEBUG(llvm::dbgs() << "  don't hoist above availability check at bb"
-                           << DomParentBB->getDebugID() << "\n");
+        LLVM_DEBUG(llvm::dbgs() << "  don't hoist above availability check "
+                                   "at bb"
+                                << DomParentBB->getDebugID() << "\n");
         break;
       }
       BB = DomParentBB;
@@ -519,13 +524,13 @@ void SILGlobalOpt::placeInitializers(SILFunction *InitF,
 
     if (BB == HoistAI->getParent()) {
       // BB is either unreachable or not in a loop.
-      DEBUG(llvm::dbgs() << "  skipping (not in a loop): " << *HoistAI
-                         << "  in " << HoistAI->getFunction()->getName()
-                         << "\n");
+      LLVM_DEBUG(llvm::dbgs() << "  skipping (not in a loop): " << *HoistAI
+                              << "  in " << HoistAI->getFunction()->getName()
+                              << "\n");
       continue;
     }
 
-    DEBUG(llvm::dbgs() << "  hoisting: " << *HoistAI << "  in "
+    LLVM_DEBUG(llvm::dbgs() << "  hoisting: " << *HoistAI << "  in "
                        << HoistAI->getFunction()->getName() << "\n");
     HoistAI->moveBefore(&*BB->begin());
     placeFuncRef(HoistAI, DT);
@@ -534,23 +539,24 @@ void SILGlobalOpt::placeInitializers(SILFunction *InitF,
 }
 
 /// Create a getter function from the initializer function.
-static SILFunction *genGetterFromInit(SILFunction *InitF, VarDecl *varDecl) {
+static SILFunction *genGetterFromInit(SILOptFunctionBuilder &FunctionBuilder,
+                                      SILFunction *InitF, VarDecl *varDecl) {
   // Generate a getter from the global init function without side-effects.
 
-  auto *GetterF = getGlobalGetterFunction(InitF->getModule(),
+  auto *GetterF = getGlobalGetterFunction(FunctionBuilder,
+                                          InitF->getModule(),
                                           InitF->getLocation(),
                                           varDecl);
-  if (!InitF->hasQualifiedOwnership())
-    GetterF->setUnqualifiedOwnership();
+  if (!InitF->hasOwnership())
+    GetterF->setOwnershipEliminated();
 
-  auto *EntryBB = GetterF->createBasicBlock();
-  // Copy InitF into GetterF
-  BasicBlockCloner Cloner(&*InitF->begin(), EntryBB, /*WithinFunction=*/false);
-  Cloner.clone();
+  // Copy InitF into GetterF, including the entry arguments.
+  SILFunctionCloner Cloner(GetterF);
+  Cloner.cloneFunction(InitF);
   GetterF->setInlined();
 
   // Find the store instruction
-  auto BB = EntryBB;
+  auto *BB = GetterF->getEntryBlock();
   SILValue Val;
   SILInstruction *Store;
   for (auto II = BB->begin(), E = BB->end(); II != E;) {
@@ -642,29 +648,26 @@ replaceLoadsByKnownValue(BuiltinInst *CallToOnce, SILFunction *AddrF,
   // Make this addressor transparent.
   AddrF->setTransparent(IsTransparent_t::IsTransparent);
 
-  for (int i = 0, e = Calls.size(); i < e; ++i) {
-    auto *Call = Calls[i];
-    SILBuilderWithScope B(Call);
-    SmallVector<SILValue, 1> Args;
-    auto *NewAI = B.createApply(Call->getLoc(), Call->getCallee(), Args, false);
-    Call->replaceAllUsesWith(NewAI);
-    eraseUsesOfInstruction(Call);
-    recursivelyDeleteTriviallyDeadInstructions(Call, true);
-    Calls[i] = NewAI;
-  }
-
   // Generate a getter from InitF which returns the value of the global.
-  auto *GetterF = genGetterFromInit(InitF, SILG->getDecl());
+  auto *GetterF = genGetterFromInit(FunctionBuilder, InitF, SILG->getDecl());
 
-  // Replace all calls of an addressor by calls of a getter .
+  // Replace all calls of an addressor by calls of a getter.
   for (int i = 0, e = Calls.size(); i < e; ++i) {
     auto *Call = Calls[i];
 
-    // Now find all uses of Call. They all should be loads, so that
-    // we can replace it.
+    // Make sure that we can go ahead and replace all uses of the
+    // address with the value.
     bool isValid = true;
     for (auto Use : Call->getUses()) {
-      if (!isa<PointerToAddressInst>(Use->getUser())) {
+      if (auto *PTAI = dyn_cast<PointerToAddressInst>(Use->getUser())) {
+        for (auto PTAIUse : PTAI->getUses()) {
+          SILInstruction *Use = PTAIUse->getUser();
+          if (!canReplaceLoadSequence(Use)) {
+            isValid = false;
+            break;
+          }
+        }
+      } else {
         isValid = false;
         break;
       }
@@ -673,6 +676,8 @@ replaceLoadsByKnownValue(BuiltinInst *CallToOnce, SILFunction *AddrF,
     if (!isValid)
       continue;
 
+    // Now find all uses of Call. They all should be loads, so that
+    // we can replace it.
     SILBuilderWithScope B(Call);
     SmallVector<SILValue, 1> Args;
     auto *GetterRef = B.createFunctionRef(Call->getLoc(), GetterF);
@@ -686,7 +691,10 @@ replaceLoadsByKnownValue(BuiltinInst *CallToOnce, SILFunction *AddrF,
       auto *PTAI = dyn_cast<PointerToAddressInst>(Use->getUser());
       assert(PTAI && "All uses should be pointer_to_address");
       for (auto PTAIUse : PTAI->getUses()) {
-        replaceLoadSequence(PTAIUse->getUser(), NewAI, B);
+        SILInstruction *Use = PTAIUse->getUser();
+
+        // The result of the getter is used as a value.
+        replaceLoadSequence(Use, NewAI);
       }
     }
 
@@ -723,8 +731,8 @@ void SILGlobalOpt::optimizeInitializer(SILFunction *AddrF,
   if (!SILG)
     return;
 
-  DEBUG(llvm::dbgs() << "GlobalOpt: use static initializer for " <<
-        SILG->getName() << '\n');
+  LLVM_DEBUG(llvm::dbgs() << "GlobalOpt: use static initializer for "
+                          << SILG->getName() << '\n');
 
   // Remove "once" call from the addressor.
   if (!isAssignedOnlyOnceInInitializer(SILG) || !SILG->getDecl()) {
@@ -808,7 +816,7 @@ void SILGlobalOpt::collectGlobalAccess(GlobalAddrInst *GAI) {
   if (GlobalVarSkipProcessing.count(SILG))
     return;
 
-  if (!isSimpleType(SILG->getLoweredType(), *Module)) {
+  if (!SILG->getLoweredType().isTrivial(*Module)) {
     GlobalVarSkipProcessing.insert(SILG);
     return;
   }
@@ -846,8 +854,8 @@ void SILGlobalOpt::collectGlobalAccess(GlobalAddrInst *GAI) {
 // that returns the value of this variable.
 void SILGlobalOpt::optimizeGlobalAccess(SILGlobalVariable *SILG,
                                         StoreInst *SI) {
-  DEBUG(llvm::dbgs() << "GlobalOpt: use static initializer for " <<
-        SILG->getName() << '\n');
+  LLVM_DEBUG(llvm::dbgs() << "GlobalOpt: use static initializer for "
+                          << SILG->getName() << '\n');
 
   if (GlobalVarSkipProcessing.count(SILG))
     return;
@@ -861,7 +869,7 @@ void SILGlobalOpt::optimizeGlobalAccess(SILGlobalVariable *SILG,
     return;
 
   // Generate a getter only if there are any loads from this variable.
-  SILFunction *GetterF = genGetterFromInit(SI, SILG);
+  SILFunction *GetterF = genGetterFromInit(FunctionBuilder, SI, SILG);
   if (!GetterF)
     return;
 
@@ -887,6 +895,11 @@ bool SILGlobalOpt::run() {
     // Don't optimize functions that are marked with the opt.never attribute.
     if (!F.shouldOptimize())
       continue;
+
+    // TODO: Add support for ownership.
+    if (F.hasOwnership()) {
+      continue;
+    }
 
     // Cache cold blocks per function.
     ColdBlockInfo ColdBlocks(DA);
@@ -938,7 +951,8 @@ namespace {
 class SILGlobalOptPass : public SILModuleTransform {
   void run() override {
     auto *DA = PM->getAnalysis<DominanceAnalysis>();
-    if (SILGlobalOpt(getModule(), DA).run()) {
+    SILOptFunctionBuilder FunctionBuilder(*this);
+    if (SILGlobalOpt(FunctionBuilder, getModule(), DA).run()) {
       invalidateAll();
     }
   }

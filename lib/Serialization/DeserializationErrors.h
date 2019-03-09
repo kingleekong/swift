@@ -70,6 +70,7 @@ class XRefTracePath {
       case Kind::Unknown:
         return Identifier();
       }
+      llvm_unreachable("unhandled kind");
     }
 
     void print(raw_ostream &os) const {
@@ -116,9 +117,6 @@ class XRefTracePath {
         case Set:
           os << "(setter)";
           break;
-        case MaterializeForSet:
-          os << "(materializeForSet)";
-          break;
         case Address:
           os << "(addressor)";
           break;
@@ -130,6 +128,12 @@ class XRefTracePath {
           break;
         case DidSet:
           os << "(didSet)";
+          break;
+        case Read:
+          os << "(read)";
+          break;
+        case Modify:
+          os << "(modify)";
           break;
         default:
           os << "(unknown accessor kind)";
@@ -224,8 +228,7 @@ public:
   enum Flag : unsigned {
     DesignatedInitializer = 1 << 0,
     NeedsVTableEntry = 1 << 1,
-    NeedsAllocatingVTableEntry = 1 << 2,
-    NeedsFieldOffsetVectorEntry = 1 << 3,
+    NeedsFieldOffsetVectorEntry = 1 << 2,
   };
   using Flags = OptionSet<Flag>;
 
@@ -243,9 +246,6 @@ public:
   }
   bool needsVTableEntry() const {
     return flags.contains(Flag::NeedsVTableEntry);
-  }
-  bool needsAllocatingVTableEntry() const {
-    return flags.contains(Flag::NeedsAllocatingVTableEntry);
   }
   bool needsFieldOffsetVectorEntry() const {
     return flags.contains(Flag::NeedsFieldOffsetVectorEntry);
@@ -275,6 +275,26 @@ public:
   void log(raw_ostream &OS) const override {
     OS << message << "\n";
     path.print(OS);
+  }
+
+  std::error_code convertToErrorCode() const override {
+    return llvm::inconvertibleErrorCode();
+  }
+};
+
+class XRefNonLoadedModuleError :
+    public llvm::ErrorInfo<XRefNonLoadedModuleError, DeclDeserializationError> {
+  friend ErrorInfo;
+  static const char ID;
+  void anchor() override;
+
+public:
+  explicit XRefNonLoadedModuleError(Identifier name) {
+    this->name = name;
+  }
+
+  void log(raw_ostream &OS) const override {
+    OS << "module '" << name << "' was not loaded";
   }
 
   std::error_code convertToErrorCode() const override {

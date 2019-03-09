@@ -51,9 +51,6 @@ bool isReleaseInstruction(SILInstruction *II);
 bool mayDecrementRefCount(SILInstruction *User, SILValue Ptr,
                           AliasAnalysis *AA);
 
-/// \returns True if the user \p User checks the ref count of a pointer.
-bool mayCheckRefCount(SILInstruction *User);
-
 /// \returns True if the \p User might use the pointer \p Ptr in a manner that
 /// requires \p Ptr to be alive before Inst or the release of Ptr may use memory
 /// accessed by \p User.
@@ -230,7 +227,7 @@ private:
     Optional<ArrayRef<SILInstruction *>> getFullyPostDomReleases() const {
       if (releases.empty() || foundSomeButNotAllReleases())
         return None;
-      return {releases};
+      return ArrayRef<SILInstruction *>(releases);
     }
 
     /// If we were able to find a set of releases for this argument, but those

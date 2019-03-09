@@ -68,7 +68,7 @@ class Z0 {
     // expected-note @+2 {{delegation occurs here}}
 
     self.init(5, 5) // expected-error{{cannot invoke 'Z0.init' with an argument list of type '(Int, Int)'}}
-    // expected-note @-1 {{overloads for 'Z0.init' exist with these partially matching parameter lists: (), (value: Int), (value: Double)}}
+    // expected-note @-1 {{overloads for 'Z0.init' exist with these partially matching parameter lists: (), (value: Double), (value: Int)}}
   }
 
   init(value: Int) { /* ... */ }
@@ -78,7 +78,7 @@ class Z0 {
 struct Z1 {
   init() {
     self.init(5, 5) // expected-error{{cannot invoke 'Z1.init' with an argument list of type '(Int, Int)'}}
-  // expected-note @-1 {{overloads for 'Z1.init' exist with these partially matching parameter lists: (), (value: Int), (value: Double)}}
+  // expected-note @-1 {{overloads for 'Z1.init' exist with these partially matching parameter lists: (), (value: Double), (value: Int)}}
   }
 
   init(value: Int) { /* ... */ }
@@ -91,7 +91,7 @@ enum Z2 {
 
   init() {
     self.init(5, 5) // expected-error{{cannot invoke 'Z2.init' with an argument list of type '(Int, Int)'}}
-    // expected-note @-1 {{overloads for 'Z2.init' exist with these partially matching parameter lists: (), (value: Int), (value: Double)}}
+    // expected-note @-1 {{overloads for 'Z2.init' exist with these partially matching parameter lists: (), (value: Double), (value: Int)}}
   }
 
   init(value: Int) { /* ... */ }
@@ -101,7 +101,7 @@ enum Z2 {
 // Ill-formed initialization: wrong context.
 class Z3 {
   func f() {
-    self.init() // expected-error{{'init' is a member of the type; use 'type(of: ...)' to initialize a new object of the same dynamic type}} {{10-10=type(of: }} {{14-14=)}} 
+    self.init() // expected-error{{'init' is a member of the type; use 'type(of: ...)' to initialize a new object of the same dynamic type}} {{10-10=type(of: }} {{14-14=)}}
   }
 
   init() { }
@@ -112,8 +112,8 @@ class Z4 {
   init() {} // expected-note{{selected non-required initializer}}
 
   convenience init(other: Z4) {
-    other.init() // expected-error{{'init' is a member of the type; use 'type(of: ...)' to initialize a new object of the same dynamic type}} {{11-11=type(of: }} {{15-15=)}} 
-    type(of: other).init() // expected-error{{must use a 'required' initializer}} expected-warning{{unused}}
+    other.init() // expected-error{{'init' is a member of the type; use 'type(of: ...)' to initialize a new object of the same dynamic type}} {{11-11=type(of: }} {{15-15=)}}
+    type(of: other).init() // expected-error{{must use a 'required' initializer}}
   }
 }
 
@@ -121,7 +121,7 @@ class Z5 : Z4 {
   override init() { }
 
   convenience init(other: Z5) {
-    other.init() // expected-error{{'init' is a member of the type; use 'type(of: ...)' to initialize a new object of the same dynamic type}} {{11-11=type(of: }} {{15-15=)}} 
+    other.init() // expected-error{{'init' is a member of the type; use 'type(of: ...)' to initialize a new object of the same dynamic type}} {{11-11=type(of: }} {{15-15=)}}
   }
 }
 
@@ -150,7 +150,7 @@ struct RDar16603812 {
    var i = 42
    init() {}
    func foo() {
-      self.init() // expected-error {{'init' is a member of the type; use 'type(of: ...)' to initialize a new object of the same dynamic type}} {{12-12=type(of: }} {{16-16=)}} 
+      self.init() // expected-error {{'init' is a member of the type; use 'type(of: ...)' to initialize a new object of the same dynamic type}} {{12-12=type(of: }} {{16-16=)}}
       type(of: self).init() // expected-warning{{result of 'RDar16603812' initializer is unused}}
    }
 }
@@ -199,7 +199,7 @@ class D: C {
   }
 
   func foo() {
-    self.init(x: 0) // expected-error{{'init' is a member of the type; use 'type(of: ...)' to initialize a new object of the same dynamic type}} {{10-10=type(of: }} {{14-14=)}} 
+    self.init(x: 0) // expected-error{{'init' is a member of the type; use 'type(of: ...)' to initialize a new object of the same dynamic type}} {{10-10=type(of: }} {{14-14=)}}
   }
   func bar() {
     super.init(x: 0) // expected-error{{'super.init' cannot be called outside of an initializer}}
@@ -270,9 +270,9 @@ func foo<T: C>(_ x: T, y: T.Type) where T: P {
   var c3a = type(of: x).init() // expected-error{{'required' initializer}}
   var c4a = type(of: x).init(proto: "")
 
-  var ci1 = x.init(required: 0) // expected-error{{'init' is a member of the type; use 'type(of: ...)' to initialize a new object of the same dynamic type}} {{15-15=type(of: }} {{19-19=)}} 
-  var ci2 = x.init(x: 0) // expected-error{{'init' is a member of the type; use 'type(of: ...)' to initialize a new object of the same dynamic type}} {{15-15=type(of: }} {{19-19=)}} 
-  var ci3 = x.init() // expected-error{{'init' is a member of the type; use 'type(of: ...)' to initialize a new object of the same dynamic type}} {{15-15=type(of: }} {{19-19=)}} 
+  var ci1 = x.init(required: 0) // expected-error{{'init' is a member of the type; use 'type(of: ...)' to initialize a new object of the same dynamic type}} {{15-15=type(of: }} {{19-19=)}}
+  var ci2 = x.init(x: 0) // expected-error{{'init' is a member of the type; use 'type(of: ...)' to initialize a new object of the same dynamic type}} {{15-15=type(of: }} {{19-19=)}}
+  var ci3 = x.init() // expected-error{{'init' is a member of the type; use 'type(of: ...)' to initialize a new object of the same dynamic type}} {{15-15=type(of: }} {{19-19=)}}
   var ci4 = x.init(proto: "") // expected-error{{'init' is a member of the type; use 'type(of: ...)' to initialize a new object of the same dynamic type}} {{15-15=type(of: }} {{19-19=)}} 
 
   var ci1a = x(required: 0) // expected-error{{cannot call value of non-function type 'T'}}
@@ -294,8 +294,7 @@ func foo<T: C>(_ x: T, y: T.Type) where T: P {
   var cs2 = T.init(x: 0) // expected-error{{'required' initializer}}
   var cs3 = T.init() // expected-error{{'required' initializer}}
   var cs4 = T.init(proto: "")
-  var cs5 = T.init(notfound: "") // expected-error{{argument labels '(notfound:)' do not match any available overloads}}
-  // expected-note @-1 {{overloads for 'T.Type.init' exist with these partially matching parameter lists: (x: Int), (required: Double), (proto: String)}}
+  var cs5 = T.init(notfound: "") // expected-error{{incorrect argument label in call (have 'notfound:', expected 'proto:')}}
 
   var csf1: (Double) -> T = T.init
   var csf2: (Int) -> T    = T.init // expected-error{{'required' initializer}}
@@ -315,12 +314,12 @@ func foo<T: C>(_ x: T, y: T.Type) where T: P {
 class TestOverloadSets {
   convenience init() {
     self.init(5, 5) // expected-error{{cannot invoke 'TestOverloadSets.init' with an argument list of type '(Int, Int)'}}
-    // expected-note @-1 {{overloads for 'TestOverloadSets.init' exist with these partially matching parameter lists: (), (a: Z0), (value: Int), (value: Double)}}
+    // expected-note @-1 {{overloads for 'TestOverloadSets.init' exist with these partially matching parameter lists: (), (a: Z0), (value: Double), (value: Int)}}
   }
   
   convenience init(a : Z0) {
     self.init(42 as Int8) // expected-error{{argument labels '(_:)' do not match any available overloads}}
-    // expected-note @-1 {{overloads for 'TestOverloadSets.init' exist with these partially matching parameter lists: (a: Z0), (value: Int), (value: Double)}}
+    // expected-note @-1 {{overloads for 'TestOverloadSets.init' exist with these partially matching parameter lists: (a: Z0), (value: Double), (value: Int)}}
   }
   
   init(value: Int) { /* ... */ }
@@ -338,9 +337,8 @@ class TestNestedExpr {
   }
 
   convenience init(b: Int) {
-    func use(_ x: ()) {} // expected-note {{'use' declared here}}
-    use(self.init())
-    // FIXME: rdar://41416911 // expected-error@-1 {{missing argument for parameter #1 in call}}
+    func use(_ x: ()) {}
+    use(self.init()) // expected-error {{initializer delegation ('self.init') cannot be nested in another expression}}
   }
 
   convenience init(c: Int) {
@@ -353,9 +351,8 @@ class TestNestedExpr {
   }
 
   convenience init(e: Int) {
-    func use(_ x: ()) {} // expected-note {{'use' declared here}}
-    use(self.init(fail: true)!)
-    // FIXME: rdar://41416911 // expected-error@-1 {{missing argument for parameter #1 in call}}
+    func use(_ x: ()) {}
+    use(self.init(fail: true)!) // expected-error {{initializer delegation ('self.init') cannot be nested in another expression}}
   }
 
   convenience init(f: Int) {
@@ -368,9 +365,8 @@ class TestNestedExpr {
   }
 
   convenience init(h: Int) {
-    func use(_ x: ()) {} // expected-note {{'use' declared here}}
-    use(try! self.init(error: true))
-    // FIXME: rdar://41416911 // expected-error@-1 {{missing argument for parameter #1 in call}}
+    func use(_ x: ()) {}
+    use(try! self.init(error: true)) // expected-error {{initializer delegation ('self.init') cannot be nested in another expression}}
   }
 
   convenience init(i: Int) {
@@ -400,6 +396,11 @@ class TestNestedExpr {
       // expected-error@-1 {{initializer delegation ('self.init') cannot be nested in another expression}}
     }
   }
+
+  convenience init(k: Int) {
+    func use(_ x: Any...) {}
+    use(self.init()) // expected-error {{initializer delegation ('self.init') cannot be nested in another expression}}
+  }
 }
 
 class TestNestedExprSub : TestNestedExpr {
@@ -409,9 +410,8 @@ class TestNestedExprSub : TestNestedExpr {
   }
 
   init(b: Int) {
-    func use(_ x: ()) {} // expected-note {{'use' declared here}}
-    use(super.init())
-    // FIXME: rdar://41416911 // expected-error@-1 {{missing argument for parameter #1 in call}}
+    func use(_ x: ()) {}
+    use(super.init()) // expected-error {{initializer chaining ('super.init') cannot be nested in another expression}}
   }
 
   init(c: Int) {
@@ -424,9 +424,8 @@ class TestNestedExprSub : TestNestedExpr {
   }
 
   init(e: Int) {
-    func use(_ x: ()) {} // expected-note {{'use' declared here}}
-    use(super.init(fail: true)!)
-    // FIXME: rdar://41416911 // expected-error@-1 {{missing argument for parameter #1 in call}}
+    func use(_ x: ()) {}
+    use(super.init(fail: true)!) // expected-error {{initializer chaining ('super.init') cannot be nested in another expression}}
   }
 
   init(f: Int) {
@@ -439,13 +438,17 @@ class TestNestedExprSub : TestNestedExpr {
   }
 
   init(h: Int) {
-    func use(_ x: ()) {} // expected-note {{'use' declared here}}
-    use(try! super.init(error: true))
-    // FIXME: rdar://41416911 // expected-error@-1 {{missing argument for parameter #1 in call}}
+    func use(_ x: ()) {}
+    use(try! super.init(error: true)) // expected-error {{initializer chaining ('super.init') cannot be nested in another expression}}
   }
 
   init(i: Int) {
     _ = ((), try! super.init(error: true)) // expected-error {{initializer chaining ('super.init') cannot be nested in another expression}}
+  }
+
+  init(j: Int) {
+    func use(_ x: Any...) {}
+    use(super.init()) // expected-error {{initializer chaining ('super.init') cannot be nested in another expression}}
   }
 }
 

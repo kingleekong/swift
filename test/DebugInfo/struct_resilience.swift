@@ -13,13 +13,13 @@
 // RUN:    -enable-resilience-bypass | %FileCheck %s --check-prefix=CHECK-LLDB
 import resilient_struct
 
-// CHECK-LABEL: define{{.*}} swiftcc void @"$S17struct_resilience9takesSizeyy010resilient_A00D0VF"(%swift.opaque* noalias nocapture)
-// CHECK-LLDB-LABEL: define{{.*}} swiftcc void @"$S17struct_resilience9takesSizeyy010resilient_A00D0VF"(%T16resilient_struct4SizeV* noalias nocapture dereferenceable({{8|16}}))
+// CHECK-LABEL: define{{.*}} swiftcc void @"$s17struct_resilience9takesSizeyy010resilient_A00D0VF"(%swift.opaque* noalias nocapture)
+// CHECK-LLDB-LABEL: define{{.*}} swiftcc void @"$s17struct_resilience9takesSizeyy010resilient_A00D0VF"(%T16resilient_struct4SizeV* noalias nocapture dereferenceable({{8|16}}))
 public func takesSize(_ s: Size) {}
 
 
-// CHECK-LABEL: define{{.*}} swiftcc void @"$S17struct_resilience1fyyF"()
-// CHECK-LLDB-LABEL: define{{.*}} swiftcc void @"$S17struct_resilience1fyyF"()
+// CHECK-LABEL: define{{.*}} swiftcc void @"$s17struct_resilience1fyyF"()
+// CHECK-LLDB-LABEL: define{{.*}} swiftcc void @"$s17struct_resilience1fyyF"()
 func f() {
   let s1 = Size(w: 1, h: 2)
   takesSize(s1)
@@ -38,11 +38,8 @@ func f() {
 f()
 
 // CHECK: ![[TY:[0-9]+]] = !DICompositeType(tag: DW_TAG_structure_type, name: "Size",
-// CHECK: ![[TY:[0-9]+]] = !DICompositeType(tag: DW_TAG_structure_type, name: "Size",
 
 // CHECK: ![[V1]] = !DILocalVariable(name: "s1", {{.*}}type: ![[TY]])
 
 // CHECK-LLDB: ![[TY:[0-9]+]] = !DICompositeType(tag: DW_TAG_structure_type, name: "Size",
-// CHECK-LLDB: ![[TY:[0-9]+]] = !DICompositeType(tag: DW_TAG_structure_type, name: "Size",
 // CHECK-LLDB: ![[V1]] = !DILocalVariable(name: "s1", {{.*}}type: ![[TY]])
-

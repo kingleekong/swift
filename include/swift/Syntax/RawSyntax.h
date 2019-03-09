@@ -31,6 +31,7 @@
 
 #include "swift/Basic/InlineBitfield.h"
 #include "swift/Syntax/References.h"
+#include "swift/Syntax/SyntaxArena.h"
 #include "swift/Syntax/SyntaxKind.h"
 #include "swift/Syntax/TokenKinds.h"
 #include "swift/Syntax/Trivia.h"
@@ -212,14 +213,27 @@ struct SyntaxPrintOptions {
   bool PrintTrivialNodeKind = false;
 };
 
+typedef unsigned SyntaxNodeId;
+
 /// RawSyntax - the strictly immutable, shared backing nodes for all syntax.
 ///
 /// This is implementation detail - do not expose it in public API.
 class RawSyntax final
-    : public llvm::ThreadSafeRefCountedBase<RawSyntax>,
-      private llvm::TrailingObjects<RawSyntax, RC<RawSyntax>, OwnedString,
+    : private llvm::TrailingObjects<RawSyntax, RC<RawSyntax>, OwnedString,
                                     TriviaPiece> {
   friend TrailingObjects;
+
+  /// The ID that shall be used for the next node that is created and does not
+  /// have a manually specified id
+  static SyntaxNodeId NextFreeNodeId;
+
+  /// An ID of this node that is stable across incremental parses
+  SyntaxNodeId NodeId;
+
+  /// If this node was allocated using a \c SyntaxArena's bump allocator, a
+  /// reference to the arena to keep the underlying memory buffer of this node
+  /// alive. If this is a \c nullptr, the node owns its own memory buffer.
+  RC<SyntaxArena> Arena;
 
   union {
     uint64_t OpaqueBits;
@@ -228,11 +242,8 @@ class RawSyntax final
       unsigned Kind : bitmax(NumSyntaxKindBits, 8);
       /// Whether this piece of syntax was actually present in the source.
       unsigned Presence : 1;
-      /// Whether this piece of syntax was constructed with manually managed
-      /// memory.
-      unsigned ManualMemory : 1;
     } Common;
-    enum { NumRawSyntaxBits = bitmax(NumSyntaxKindBits, 8) + 1 + 1 };
+    enum { NumRawSyntaxBits = bitmax(NumSyntaxKindBits, 8) + 1 };
 
     // For "layout" nodes.
     struct {
@@ -242,6 +253,8 @@ class RawSyntax final
       /// Number of children this "layout" node has.
       unsigned NumChildren : 32;
       /// Number of bytes this node takes up spelled out in the source code
+      /// A value of UINT32_MAX indicates that the text length has not been
+      /// computed yet.
       unsigned TextLength : 32;
     } Layout;
 
@@ -271,59 +284,109 @@ class RawSyntax final
              : 0;
   }
 
-  /// Constructor for creating layout nodes
+  /// Constructor for creating layout nodes.
+  /// If the node has been allocated inside the bump allocator of a
+  /// \c SyntaxArena, that arena must be passed as \p Arena to retain the node's
+  /// underlying storage.
+  /// If \p NodeId is \c None, the next free NodeId is used, if it is passed,
+  /// the caller needs to assure that the node ID has not been used yet.
   RawSyntax(SyntaxKind Kind, ArrayRef<RC<RawSyntax>> Layout,
-            SourcePresence Presence, bool ManualMemory);
+            SourcePresence Presence, const RC<SyntaxArena> &Arena,
+            llvm::Optional<SyntaxNodeId> NodeId);
   /// Constructor for creating token nodes
-  RawSyntax(tok TokKind, OwnedString Text,
-            ArrayRef<TriviaPiece> LeadingTrivia,
-            ArrayRef<TriviaPiece> TrailingTrivia,
-            SourcePresence Presence, bool ManualMemory);
+  /// \c SyntaxArena, that arena must be passed as \p Arena to retain the node's
+  /// underlying storage.
+  /// If \p NodeId is \c None, the next free NodeId is used, if it is passed,
+  /// the caller needs to assure that the NodeId has not been used yet.
+  RawSyntax(tok TokKind, OwnedString Text, ArrayRef<TriviaPiece> LeadingTrivia,
+            ArrayRef<TriviaPiece> TrailingTrivia, SourcePresence Presence,
+            const RC<SyntaxArena> &Arena, llvm::Optional<SyntaxNodeId> NodeId);
+
+  /// Compute the node's text length by summing up the length of its childern
+  size_t computeTextLength() {
+    size_t TextLength = 0;
+    for (size_t I = 0, NumChildren = getNumChildren(); I < NumChildren; ++I) {
+      auto &ChildNode = getChild(I);
+      if (ChildNode && !ChildNode->isMissing()) {
+        TextLength += ChildNode->getTextLength();
+      }
+    }
+    return TextLength;
+  }
+
+  mutable std::atomic<int> RefCount;
 
 public:
   ~RawSyntax();
 
+  // This is a copy-pased implementation of llvm::ThreadSafeRefCountedBase with
+  // the difference that we do not delete the RawSyntax node's memory if the
+  // node was allocated within a SyntaxArena and thus doesn't own its memory.
+  void Retain() const { RefCount.fetch_add(1, std::memory_order_relaxed); }
+
   void Release() const {
-    if (Bits.Common.ManualMemory)
-      return;
-    return llvm::ThreadSafeRefCountedBase<RawSyntax>::Release();
-  }
-  void Retain() const {
-    if (Bits.Common.ManualMemory)
-      return;
-    return llvm::ThreadSafeRefCountedBase<RawSyntax>::Retain();
+    int NewRefCount = RefCount.fetch_sub(1, std::memory_order_acq_rel) - 1;
+    assert(NewRefCount >= 0 && "Reference count was already zero.");
+    if (NewRefCount == 0) {
+      if (Arena) {
+        // The node was allocated inside a SyntaxArena and thus doesn't own its
+        // own memory region. Hence we cannot free it. It will be deleted once
+        // the last RawSyntax node allocated with it will release its reference
+        // to the arena.
+        this->~RawSyntax();
+      } else {
+        delete this;
+      }
+    }
   }
 
   /// \name Factory methods.
   /// @{
-  
+
   /// Make a raw "layout" syntax node.
   static RC<RawSyntax> make(SyntaxKind Kind, ArrayRef<RC<RawSyntax>> Layout,
                             SourcePresence Presence,
-                            SyntaxArena *Arena = nullptr);
+                            llvm::Optional<SyntaxNodeId> NodeId = llvm::None) {
+    RC<SyntaxArena> Arena = nullptr;
+    return make(Kind, Layout, Presence, Arena, NodeId);
+  }
+
+  /// Make a raw "layout" syntax node that was allocated in \p Arena.
+  static RC<RawSyntax> make(SyntaxKind Kind, ArrayRef<RC<RawSyntax>> Layout,
+                            SourcePresence Presence,
+                            const RC<SyntaxArena> &Arena,
+                            llvm::Optional<SyntaxNodeId> NodeId = llvm::None);
 
   /// Make a raw "token" syntax node.
   static RC<RawSyntax> make(tok TokKind, OwnedString Text,
                             ArrayRef<TriviaPiece> LeadingTrivia,
                             ArrayRef<TriviaPiece> TrailingTrivia,
                             SourcePresence Presence,
-                            SyntaxArena *Arena = nullptr);
+                            llvm::Optional<SyntaxNodeId> NodeId = llvm::None) {
+    RC<SyntaxArena> Arena = nullptr;
+    return make(TokKind, Text, LeadingTrivia, TrailingTrivia, Presence, Arena,
+                NodeId);
+  }
+
+  /// Make a raw "token" syntax node that was allocated in \p Arena.
+  static RC<RawSyntax> make(tok TokKind, OwnedString Text,
+                            ArrayRef<TriviaPiece> LeadingTrivia,
+                            ArrayRef<TriviaPiece> TrailingTrivia,
+                            SourcePresence Presence,
+                            const RC<SyntaxArena> &Arena,
+                            llvm::Optional<SyntaxNodeId> NodeId = llvm::None);
 
   /// Make a missing raw "layout" syntax node.
-  static RC<RawSyntax> missing(SyntaxKind Kind, SyntaxArena *Arena = nullptr) {
+  static RC<RawSyntax> missing(SyntaxKind Kind,
+                               RC<SyntaxArena> Arena = nullptr) {
     return make(Kind, {}, SourcePresence::Missing, Arena);
   }
 
   /// Make a missing raw "token" syntax node.
   static RC<RawSyntax> missing(tok TokKind, OwnedString Text,
-                               SyntaxArena *Arena = nullptr) {
+                               RC<SyntaxArena> Arena = nullptr) {
     return make(TokKind, Text, {}, {}, SourcePresence::Missing, Arena);
   }
-
-  static RC<RawSyntax> getToken(SyntaxArena &Arena, tok TokKind,
-                                OwnedString Text,
-                                ArrayRef<TriviaPiece> LeadingTrivia,
-                                ArrayRef<TriviaPiece> TrailingTrivia);
 
   /// @}
 
@@ -334,6 +397,9 @@ public:
   SyntaxKind getKind() const {
     return static_cast<SyntaxKind>(Bits.Common.Kind);
   }
+
+  /// Get an ID for this node that is stable across incremental parses
+  SyntaxNodeId getId() const { return NodeId; }
 
   /// Returns true if the node is "missing" in the source (i.e. it was
   /// expected (or optional) but not written.
@@ -372,11 +438,16 @@ public:
     return static_cast<tok>(Bits.Token.TokenKind);
   }
 
-  /// Return the text of the token.
-  StringRef getTokenText() const {
+  /// Return the text of the token as an \c OwnedString. Keeping a reference to
+  /// this string will keep it alive even if the syntax node gets freed.
+  OwnedString getOwnedTokenText() const {
     assert(isToken());
-    return getTrailingObjects<OwnedString>()->str();
+    return *getTrailingObjects<OwnedString>();
   }
+
+  /// Return the text of the token as a reference. The referenced buffer may
+  /// disappear when the syntax node gets freed.
+  StringRef getTokenText() const { return getOwnedTokenText().str(); }
 
   /// Return the leading trivia list of the token.
   ArrayRef<TriviaPiece> getLeadingTrivia() const {
@@ -402,7 +473,7 @@ public:
   /// trivia instead.
   RC<RawSyntax>
   withLeadingTrivia(ArrayRef<TriviaPiece> NewLeadingTrivia) const {
-    return make(getTokenKind(), getTokenText(), NewLeadingTrivia,
+    return make(getTokenKind(), getOwnedTokenText(), NewLeadingTrivia,
                 getTrailingTrivia(), getPresence());
   }
 
@@ -414,7 +485,7 @@ public:
   /// trivia instead.
   RC<RawSyntax>
   withTrailingTrivia(ArrayRef<TriviaPiece> NewTrailingTrivia) const {
-    return make(getTokenKind(), getTokenText(), getLeadingTrivia(),
+    return make(getTokenKind(), getOwnedTokenText(), getLeadingTrivia(),
                 NewTrailingTrivia, getPresence());
   }
 
@@ -458,6 +529,9 @@ public:
       accumulateAbsolutePosition(Pos);
       return Pos.getOffset();
     } else {
+      if (Bits.Layout.TextLength == UINT32_MAX) {
+        Bits.Layout.TextLength = computeTextLength();
+      }
       return Bits.Layout.TextLength;
     }
   }
@@ -506,5 +580,9 @@ public:
 
 } // end namespace syntax
 } // end namespace swift
+
+namespace llvm {
+raw_ostream &operator<<(raw_ostream &OS, swift::syntax::AbsolutePosition Pos);
+} // end namespace llvm
 
 #endif // SWIFT_SYNTAX_RAWSYNTAX_H

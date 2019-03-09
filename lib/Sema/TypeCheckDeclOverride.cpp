@@ -20,7 +20,9 @@
 #include "swift/AST/ASTVisitor.h"
 #include "swift/AST/Availability.h"
 #include "swift/AST/Decl.h"
+#include "swift/AST/NameLookupRequests.h"
 #include "swift/AST/ParameterList.h"
+#include "swift/AST/TypeCheckRequests.h"
 using namespace swift;
 
 static void adjustFunctionTypeForOverride(Type &type) {
@@ -61,8 +63,7 @@ static Type dropResultOptionality(Type type, unsigned uncurryLevel) {
 }
 
 Type swift::getMemberTypeForComparison(ASTContext &ctx, ValueDecl *member,
-                                       ValueDecl *derivedDecl,
-                                       bool stripLabels) {
+                                       ValueDecl *derivedDecl) {
   auto *method = dyn_cast<AbstractFunctionDecl>(member);
   ConstructorDecl *ctor = nullptr;
   if (method)
@@ -70,12 +71,22 @@ Type swift::getMemberTypeForComparison(ASTContext &ctx, ValueDecl *member,
 
   auto abstractStorage = dyn_cast<AbstractStorageDecl>(member);
   assert((method || abstractStorage) && "Not a method or abstractStorage?");
-  SubscriptDecl *subscript = nullptr;
-  if (abstractStorage)
-    subscript = dyn_cast<SubscriptDecl>(abstractStorage);
+  SubscriptDecl *subscript = dyn_cast_or_null<SubscriptDecl>(abstractStorage);
+
+  if (!member->hasInterfaceType()) {
+    auto lazyResolver = ctx.getLazyResolver();
+    assert(lazyResolver && "Need to resolve interface type");
+    lazyResolver->resolveDeclSignature(member);
+  }
 
   auto memberType = member->getInterfaceType();
   if (derivedDecl) {
+    if (!derivedDecl->hasInterfaceType()) {
+      auto lazyResolver = ctx.getLazyResolver();
+      assert(lazyResolver && "Need to resolve interface type");
+      lazyResolver->resolveDeclSignature(derivedDecl);
+    }
+
     auto *dc = derivedDecl->getDeclContext();
     auto owningType = dc->getDeclaredInterfaceType();
     assert(owningType);
@@ -86,9 +97,6 @@ Type swift::getMemberTypeForComparison(ASTContext &ctx, ValueDecl *member,
       return memberType;
   }
 
-  if (stripLabels)
-    memberType = memberType->getUnlabeledType(ctx);
-
   if (method) {
     // For methods, strip off the 'Self' type.
     memberType = memberType->castTo<AnyFunctionType>()->getResult();
@@ -97,8 +105,7 @@ Type swift::getMemberTypeForComparison(ASTContext &ctx, ValueDecl *member,
     // For subscripts, we don't have a 'Self' type, but turn it
     // into a monomorphic function type.
     auto funcTy = memberType->castTo<AnyFunctionType>();
-    memberType = FunctionType::get(funcTy->getParams(), funcTy->getResult(),
-                                   FunctionType::ExtInfo());
+    memberType = FunctionType::get(funcTy->getParams(), funcTy->getResult());
   } else {
     // For properties, strip off ownership.
     memberType = memberType->getReferenceStorageReferent();
@@ -111,6 +118,37 @@ Type swift::getMemberTypeForComparison(ASTContext &ctx, ValueDecl *member,
   }
 
   return memberType;
+}
+
+static bool areAccessorsOverrideCompatible(AbstractStorageDecl *storage,
+                                           AbstractStorageDecl *parentStorage) {
+  // It's okay for the storage to disagree about whether to use a getter or
+  // a read accessor; we'll patch up any differences when setting overrides
+  // for the accessors.  We don't want to diagnose anything involving
+  // `@_borrowed` because it is not yet part of the language.
+
+  // All the other checks are for non-static storage only.
+  if (storage->isStatic())
+    return true;
+
+  // The storage must agree on whether reads are mutating.  For accessors,
+  // this is sufficient to imply that they use the same SelfAccessKind
+  // because we do not allow accessors to be consuming.
+  if (storage->isGetterMutating() != parentStorage->isGetterMutating())
+    return false;
+
+  // We allow covariance about whether the storage itself is mutable, so we
+  // can only check mutating-ness of setters if both have one.
+  if (storage->supportsMutation() && parentStorage->supportsMutation()) {
+    // The storage must agree on whether writes are mutating.
+    if (storage->isSetterMutating() != parentStorage->isSetterMutating())
+      return false;
+
+    // Those together should imply that read-write accesses have the same
+    // mutability.
+  }
+
+  return true;
 }
 
 bool swift::isOverrideBasedOnType(ValueDecl *decl, Type declTy,
@@ -131,10 +169,34 @@ bool swift::isOverrideBasedOnType(ValueDecl *decl, Type declTy,
 
   // If this is a constructor, let's compare only parameter types.
   if (isa<ConstructorDecl>(decl)) {
+    // Within a protocol context, check for a failability mismatch.
+    if (isa<ProtocolDecl>(decl->getDeclContext())) {
+      if (cast<ConstructorDecl>(decl)->getFailability() !=
+            cast<ConstructorDecl>(parentDecl)->getFailability())
+        return false;
+    }
+
     auto fnType1 = declTy->castTo<AnyFunctionType>();
     auto fnType2 = parentDeclTy->castTo<AnyFunctionType>();
     return AnyFunctionType::equalParams(fnType1->getParams(),
                                         fnType2->getParams());
+
+  // In a non-static protocol requirement, verify that the self access kind
+  // matches.
+  } else if (auto func = dyn_cast<FuncDecl>(decl)) {
+    // We only compare `isMutating()` rather than `getSelfAccessKind()`
+    // because we don't want to complain about `nonmutating` vs. `__consuming`
+    // conflicts at this time, especially since `__consuming` is not yet
+    // officially part of the language.
+    if (!func->isStatic() &&
+        func->isMutating() != cast<FuncDecl>(parentDecl)->isMutating())
+      return false;
+
+  // In abstract storage, verify that the accessor mutating-ness matches.
+  } else if (auto storage = dyn_cast<AbstractStorageDecl>(decl)) {
+    auto parentStorage = cast<AbstractStorageDecl>(parentDecl);
+    if (!areAccessorsOverrideCompatible(storage, parentStorage))
+      return false;
   }
 
   return canDeclTy == canParentDeclTy;
@@ -150,6 +212,28 @@ static bool areOverrideCompatibleSimple(ValueDecl *decl,
         parentDecl->getFullName().getArgumentNames().size())
     return false;
 
+  // If the parent declaration is not in a class (or extension thereof) or
+  // a protocol, we cannot override it.
+  if (decl->getDeclContext()->getSelfClassDecl() &&
+      parentDecl->getDeclContext()->getSelfClassDecl()) {
+    // Okay: class override
+  } else if (isa<ProtocolDecl>(decl->getDeclContext()) &&
+             isa<ProtocolDecl>(parentDecl->getDeclContext())) {
+    // Okay: protocol override.
+  } else {
+    // Cannot be an override.
+    return false;
+  }
+
+  // The declarations must be of the same kind.
+  if (decl->getKind() != parentDecl->getKind())
+    return false;
+
+  // Ignore invalid parent declarations.
+  // FIXME: Do we really need this?
+  if (parentDecl->isInvalid())
+    return false;
+
   if (auto func = dyn_cast<FuncDecl>(decl)) {
     // Specific checking for methods.
     auto parentFunc = cast<FuncDecl>(parentDecl);
@@ -160,6 +244,10 @@ static bool areOverrideCompatibleSimple(ValueDecl *decl,
   } else if (auto ctor = dyn_cast<ConstructorDecl>(decl)) {
     auto parentCtor = cast<ConstructorDecl>(parentDecl);
     if (ctor->isGeneric() != parentCtor->isGeneric())
+      return false;
+
+    // Factory initializers cannot be overridden.
+    if (parentCtor->isFactoryInit())
       return false;
   } else if (auto var = dyn_cast<VarDecl>(decl)) {
     auto parentVar = cast<VarDecl>(parentDecl);
@@ -323,32 +411,11 @@ diagnoseMismatchedOptionals(const ValueDecl *member,
   return emittedError;
 }
 
-/// Make sure that there is an invalid 'override' attribute on the
-/// given declaration.
-static void makeInvalidOverrideAttr(ValueDecl *decl) {
-  if (auto overrideAttr = decl->getAttrs().getAttribute<OverrideAttr>()) {
-    overrideAttr->setInvalid();
-  } else {
-    auto attr = new (decl->getASTContext()) OverrideAttr(true);
-    decl->getAttrs().add(attr);
-    attr->setInvalid();
-  }
-
-  // FIXME: What about the other accessors?
-  if (auto storage = dyn_cast<AbstractStorageDecl>(decl)) {
-    if (auto getter = storage->getGetter())
-      makeInvalidOverrideAttr(getter);
-    if (auto setter = storage->getSetter())
-      makeInvalidOverrideAttr(setter);
-  }
-}
-
 /// Record that the \c overriding declarations overrides the
 /// \c overridden declaration.
 ///
 /// \returns true if an error occurred.
-static bool recordOverride(TypeChecker &TC, ValueDecl *override,
-                           ValueDecl *base, bool isKnownObjC = false);
+static bool checkSingleOverride(ValueDecl *override, ValueDecl *base);
 
 /// If the difference between the types of \p decl and \p base is something
 /// we feel confident about fixing (even partially), emit a note with fix-its
@@ -418,7 +485,6 @@ namespace {
   struct OverrideMatch {
     ValueDecl *Decl;
     bool IsExact;
-    Type SubstType;
   };
 }
 
@@ -463,8 +529,7 @@ static void diagnoseGeneralOverrideFailure(ValueDecl *decl,
                                matchDecl->getDescriptiveKind(),
                                matchDecl->getFullName());
     if (attempt == OverrideCheckingAttempt::BaseName) {
-      fixDeclarationName(diag, cast<AbstractFunctionDecl>(decl),
-                         matchDecl->getFullName());
+      fixDeclarationName(diag, decl, matchDecl->getFullName());
     }
   }
 }
@@ -478,8 +543,8 @@ static bool parameterTypesMatch(const ValueDecl *derivedDecl,
     auto *base = dyn_cast<AbstractFunctionDecl>(baseDecl);
     if (!base)
       return false;
-    baseParams = base->getParameterList(1);
-    derivedParams = derived->getParameterList(1);
+    baseParams = base->getParameters();
+    derivedParams = derived->getParameters();
   } else {
     auto *base = dyn_cast<SubscriptDecl>(baseDecl);
     if (!base)
@@ -523,289 +588,252 @@ static bool parameterTypesMatch(const ValueDecl *derivedDecl,
   return true;
 }
 
-/// Determine which method or subscript this method or subscript overrides
-/// (if any).
-///
-/// \returns true if an error occurred.
-bool swift::checkOverrides(TypeChecker &TC, ValueDecl *decl) {
-  if (decl->isInvalid() || decl->getOverriddenDecl())
-    return false;
+/// Returns true if the given declaration is for the `NSObject.hashValue`
+/// property.
+static bool isNSObjectHashValue(ValueDecl *baseDecl) {
+  ASTContext &ctx = baseDecl->getASTContext();
+
+  if (auto baseVar = dyn_cast<VarDecl>(baseDecl)) {
+    if (auto classDecl = baseVar->getDeclContext()->getSelfClassDecl()) {
+      return baseVar->getName() == ctx.Id_hashValue &&
+        classDecl->getName().is("NSObject") &&
+        (classDecl->getModuleContext()->getName() == ctx.Id_Foundation ||
+         classDecl->getModuleContext()->getName() == ctx.Id_ObjectiveC);
+    }
+  }
+  return false;
+}
+
+namespace {
+  /// Class that handles the checking of a particular declaration against
+  /// superclass entities that it could override.
+  class OverrideMatcher {
+    ASTContext &ctx;
+    ValueDecl *decl;
+
+    /// The set of declarations in which we'll look for overridden
+    /// methods.
+    SmallVector<NominalTypeDecl *, 2> superContexts;
+
+    /// Cached member lookup results.
+    SmallVector<ValueDecl *, 4> members;
+
+    /// The lookup name used to find \c members.
+    DeclName membersName;
+
+    /// The type of the declaration, cached here once it has been computed.
+    Type cachedDeclType;
+
+  public:
+    OverrideMatcher(ValueDecl *decl);
+
+    /// Returns true when it's possible to perform any override matching.
+    explicit operator bool() const {
+      return !superContexts.empty();
+    }
+
+    /// Whether this is an override of a class member.
+    bool isClassOverride() const {
+      return decl->getDeclContext()->getSelfClassDecl() != nullptr;
+    }
+
+    /// Whether this is an override of a protocol member.
+    bool isProtocolOverride() const {
+      return decl->getDeclContext()->getSelfProtocolDecl() != nullptr;
+    }
+
+    /// Match this declaration against potential members in the superclass,
+    /// using the heuristics appropriate for the given \c attempt.
+    SmallVector<OverrideMatch, 2> match(OverrideCheckingAttempt attempt);
+
+    /// Check each of the given matches, returning only those that
+    /// succeeded.
+    TinyPtrVector<ValueDecl *> checkPotentialOverrides(
+                                        SmallVectorImpl<OverrideMatch> &matches,
+                                        OverrideCheckingAttempt attempt);
+
+  private:
+    /// We have determined that we have an override of the given \c baseDecl.
+    ///
+    /// Check that the override itself is valid.
+    bool checkOverride(ValueDecl *baseDecl,
+                       OverrideCheckingAttempt attempt);
+
+    /// Retrieve the type of the declaration, to be used in comparisons.
+    Type getDeclComparisonType() {
+      if (!cachedDeclType) {
+        cachedDeclType = getMemberTypeForComparison(ctx, decl);
+      }
+
+      return cachedDeclType;
+    }
+
+    /// Adjust the interface of the given declaration, which is found in
+    /// a supertype of the given type.
+    Type getSuperMemberDeclType(ValueDecl *baseDecl) const {
+      auto selfType = decl->getDeclContext()->getSelfInterfaceType();
+      if (selfType->getClassOrBoundGenericClass()) {
+        selfType = selfType->getSuperclass();
+        assert(selfType && "No superclass type?");
+      }
+
+      return selfType->adjustSuperclassMemberDeclType(
+               baseDecl, decl, baseDecl->getInterfaceType());
+    }
+  };
+}
+
+OverrideMatcher::OverrideMatcher(ValueDecl *decl)
+    : ctx(decl->getASTContext()), decl(decl) {
+  // The final step for this constructor is to set up the superclass type,
+  // without which we will not perform an matching. Early exits therefore imply
+  // that there is no way we can match this declaration.
+  if (decl->isInvalid())
+    return;
 
   auto *dc = decl->getDeclContext();
+  if (auto classDecl = dc->getSelfClassDecl()) {
+    if (auto superclassDecl = classDecl->getSuperclassDecl())
+      superContexts.push_back(superclassDecl);
+  } else if (auto protocol = dyn_cast<ProtocolDecl>(dc)) {
+    auto inheritedProtocols = protocol->getInheritedProtocols();
+    superContexts.insert(superContexts.end(), inheritedProtocols.begin(),
+                         inheritedProtocols.end());
+  }
+}
 
-  auto owningTy = dc->getDeclaredInterfaceType();
-  if (!owningTy)
-    return false;
+SmallVector<OverrideMatch, 2> OverrideMatcher::match(
+                                             OverrideCheckingAttempt attempt) {
+  // If there's no matching we can do, fail.
+  if (!*this) return { };
 
-  auto classDecl = owningTy->getClassOrBoundGenericClass();
-  if (!classDecl)
-    return false;
+  auto dc = decl->getDeclContext();
 
-  Type superclass = classDecl->getSuperclass();
-  if (!superclass)
-    return false;
+  // Determine what name we should look for.
+  DeclName name;
+  switch (attempt) {
+  case OverrideCheckingAttempt::PerfectMatch:
+  case OverrideCheckingAttempt::MismatchedOptional:
+  case OverrideCheckingAttempt::MismatchedTypes:
+    name = decl->getFullName();
+    break;
+  case OverrideCheckingAttempt::BaseName:
+  case OverrideCheckingAttempt::BaseNameWithMismatchedOptional:
+    name = decl->getBaseName();
+    break;
+  case OverrideCheckingAttempt::Final:
+    // Give up.
+    return { };
+  }
 
-  // Ignore accessor methods (e.g. getters and setters), they will be handled
-  // when their storage decl is processed.
-  if (isa<AccessorDecl>(decl))
-    return false;
+  // If we don't have members available yet, or we looked them up based on a
+  // different name, look them up now.
+  if (members.empty() || name != membersName) {
+    membersName = name;
+    members.clear();
+    dc->lookupQualified(superContexts, membersName,
+                        NL_QualifiedDefault, members);
+  }
 
-  auto method = dyn_cast<AbstractFunctionDecl>(decl);
-  ConstructorDecl *ctor = nullptr;
-  if (method)
-    ctor = dyn_cast<ConstructorDecl>(method);
-
-  auto abstractStorage = dyn_cast<AbstractStorageDecl>(decl);
-  assert((method || abstractStorage) && "Not a method or abstractStorage?");
-  SubscriptDecl *subscript = nullptr;
-  if (abstractStorage)
-    subscript = dyn_cast<SubscriptDecl>(abstractStorage);
-
-  // Figure out the type of the declaration that we're using for comparisons.
-  auto declTy = getMemberTypeForComparison(TC.Context, decl);
-
-  // Look for members with the same name and matching types as this
-  // one.
-  auto attempt = OverrideCheckingAttempt::PerfectMatch;
+  // Check each member we found.
   SmallVector<OverrideMatch, 2> matches;
-  DeclName name = decl->getFullName();
-  bool hadExactMatch = false;
-  LookupResult members;
+  for (auto parentDecl : members) {
+    // Check whether there are any obvious reasons why the two given
+    // declarations do not have an overriding relationship.
+    if (!areOverrideCompatibleSimple(decl, parentDecl))
+      continue;
 
-  do {
-    switch (attempt) {
-    case OverrideCheckingAttempt::PerfectMatch:
-      break;
-    case OverrideCheckingAttempt::MismatchedOptional:
-      // Don't keep looking if the user didn't indicate it's an override.
-      if (!decl->getAttrs().hasAttribute<OverrideAttr>())
-        return false;
-      break;
-    case OverrideCheckingAttempt::MismatchedTypes:
-      break;
-    case OverrideCheckingAttempt::BaseName:
-      // Don't keep looking if this is already a simple name, or if there
-      // are no arguments.
-      if (name.isSimpleName() || name.getArgumentNames().empty())
-        return false;
-      name = name.getBaseName();
-      members.clear();
-      break;
-    case OverrideCheckingAttempt::BaseNameWithMismatchedOptional:
-      break;
-    case OverrideCheckingAttempt::Final:
-      // Give up.
-      return false;
+    auto parentMethod = dyn_cast<AbstractFunctionDecl>(parentDecl);
+    auto parentStorage = dyn_cast<AbstractStorageDecl>(parentDecl);
+    assert(parentMethod || parentStorage);
+    (void)parentMethod;
+    (void)parentStorage;
+
+    // Check whether the types are identical.
+    auto parentDeclTy = getMemberTypeForComparison(ctx, parentDecl, decl);
+    if (parentDeclTy->hasError())
+      continue;
+
+    Type declTy = getDeclComparisonType();
+    if (isOverrideBasedOnType(decl, declTy, parentDecl, parentDeclTy)) {
+      matches.push_back({parentDecl, true});
+      continue;
     }
 
-    if (members.empty()) {
-      auto lookupOptions = defaultMemberLookupOptions;
-
-      // Class methods cannot override declarations only
-      // visible via dynamic dispatch.
-      lookupOptions -= NameLookupFlags::DynamicLookup;
-
-      // Class methods cannot override declarations only
-      // visible as protocol requirements or protocol
-      // extension members.
-      lookupOptions -= NameLookupFlags::ProtocolMembers;
-      lookupOptions -= NameLookupFlags::PerformConformanceCheck;
-
-      members = TC.lookupMember(dc, superclass,
-                                name, lookupOptions);
+    // If this is a property, we accept the match and then reject it below
+    // if the types don't line up, since you can't overload properties based
+    // on types.
+    if ((isa<VarDecl>(parentDecl) && isClassOverride()) ||
+        attempt == OverrideCheckingAttempt::MismatchedTypes) {
+      matches.push_back({parentDecl, false});
+      continue;
     }
 
-    for (auto memberResult : members) {
-      auto member = memberResult.getValueDecl();
-
-      if (member->isInvalid())
-        continue;
-
-      if (member->getKind() != decl->getKind())
-        continue;
-
-      if (!dc->getAsClassOrClassExtensionContext())
-        continue;
-
-      auto parentDecl = cast<ValueDecl>(member);
-
-      // Check whether there are any obvious reasons why the two given
-      // declarations do not have an overriding relationship.
-      if (!areOverrideCompatibleSimple(decl, parentDecl))
-        continue;
-
-      auto parentMethod = dyn_cast<AbstractFunctionDecl>(parentDecl);
-      auto parentStorage = dyn_cast<AbstractStorageDecl>(parentDecl);
-      assert(parentMethod || parentStorage);
-
-      // If both are Objective-C, then match based on selectors or
-      // subscript kind and check the types separately.
-      bool objCMatch = false;
-      if (parentDecl->isObjC() && decl->isObjC()) {
-        if (method) {
-          if (method->getObjCSelector() == parentMethod->getObjCSelector())
-            objCMatch = true;
-        } else if (auto *parentSubscript =
-                     dyn_cast<SubscriptDecl>(parentStorage)) {
-          // If the subscript kinds don't match, it's not an override.
-          if (subscript->getObjCSubscriptKind()
-                == parentSubscript->getObjCSubscriptKind())
-            objCMatch = true;
-        }
-
-        // Properties don't need anything here since they are always
-        // checked by name.
-      }
-
-      if (ctor) {
-        // Factory methods cannot be overridden.
-        auto parentCtor = cast<ConstructorDecl>(parentDecl);
-        if (parentCtor->isFactoryInit())
-          continue;
-      }
-
-      // Check whether the types are identical.
-      auto parentDeclTy =
-          getMemberTypeForComparison(TC.Context, parentDecl, decl);
-      if (parentDeclTy->hasError())
-        continue;
-
-      if (isOverrideBasedOnType(decl, declTy, parentDecl, parentDeclTy)) {
-        matches.push_back({parentDecl, true, parentDeclTy});
-        hadExactMatch = true;
-        continue;
-      }
-
-      // If this is a property, we accept the match and then reject it below
-      // if the types don't line up, since you can't overload properties based
-      // on types.
-      if (isa<VarDecl>(parentDecl) ||
-          attempt == OverrideCheckingAttempt::MismatchedTypes) {
-        matches.push_back({parentDecl, false, parentDeclTy});
-        continue;
-      }
-
-      // Failing that, check for subtyping.
-      TypeMatchOptions matchMode = TypeMatchFlags::AllowOverride;
-      if (attempt == OverrideCheckingAttempt::MismatchedOptional ||
-          attempt == OverrideCheckingAttempt::BaseNameWithMismatchedOptional){
-        matchMode |= TypeMatchFlags::AllowTopLevelOptionalMismatch;
-      } else if (parentDecl->isObjC()) {
-        matchMode |= TypeMatchFlags::AllowNonOptionalForIUOParam;
-        matchMode |=
-            TypeMatchFlags::IgnoreNonEscapingForOptionalFunctionParam;
-      }
-
-      auto declFnTy = declTy->getAs<AnyFunctionType>();
-      auto parentDeclFnTy = parentDeclTy->getAs<AnyFunctionType>();
-      if (declFnTy && parentDeclFnTy) {
-        auto paramsAndResultMatch = [=]() -> bool {
-          return parameterTypesMatch(decl, parentDecl, matchMode) &&
-                 declFnTy->getResult()->matches(parentDeclFnTy->getResult(),
-                                                matchMode);
-        };
-
-        if (declFnTy->matchesFunctionType(parentDeclFnTy, matchMode,
-                                          paramsAndResultMatch)) {
-          matches.push_back({parentDecl, objCMatch, parentDeclTy});
-          hadExactMatch |= objCMatch;
-          continue;
-        }
-      } else if (declTy->matches(parentDeclTy, matchMode)) {
-        matches.push_back({parentDecl, objCMatch, parentDeclTy});
-        hadExactMatch |= objCMatch;
-        continue;
-      }
-
-      // Not a match. If we had an Objective-C match, this is a serious
-      // problem.
-      if (objCMatch) {
-        if (method) {
-          TC.diagnose(decl, diag::override_objc_type_mismatch_method,
-                      method->getObjCSelector(), declTy);
-        } else {
-          TC.diagnose(decl, diag::override_objc_type_mismatch_subscript,
-                      static_cast<unsigned>(
-                        subscript->getObjCSubscriptKind()),
-                      declTy);
-        }
-        TC.diagnose(parentDecl, diag::overridden_here_with_type,
-                    parentDeclTy);
-
-        // Put an invalid 'override' attribute here.
-        makeInvalidOverrideAttr(decl);
-
-        return true;
-      }
+    // For a protocol override, we require an exact match.
+    if (isProtocolOverride()) {
+      continue;
     }
-    if (!matches.empty())
-      break;
 
-    ++attempt;
-  } while (true);
+    // Failing that, check for subtyping.
+    TypeMatchOptions matchMode = TypeMatchFlags::AllowOverride;
+    if (attempt == OverrideCheckingAttempt::MismatchedOptional ||
+        attempt == OverrideCheckingAttempt::BaseNameWithMismatchedOptional){
+      matchMode |= TypeMatchFlags::AllowTopLevelOptionalMismatch;
+    } else if (parentDecl->isObjC()) {
+      matchMode |= TypeMatchFlags::AllowNonOptionalForIUOParam;
+      matchMode |= TypeMatchFlags::IgnoreNonEscapingForOptionalFunctionParam;
+    }
 
-  assert(!matches.empty());
+    auto declFnTy = getDeclComparisonType()->getAs<AnyFunctionType>();
+    auto parentDeclFnTy = parentDeclTy->getAs<AnyFunctionType>();
+    if (declFnTy && parentDeclFnTy) {
+      auto paramsAndResultMatch = [=]() -> bool {
+        return parameterTypesMatch(decl, parentDecl, matchMode) &&
+               declFnTy->getResult()->matches(parentDeclFnTy->getResult(),
+                                              matchMode);
+      };
 
-  // If we had an exact match, throw away any non-exact matches.
-  if (hadExactMatch)
-    matches.erase(std::remove_if(matches.begin(), matches.end(),
-                                 [&](OverrideMatch &match) {
-                                   return !match.IsExact;
-                                 }), matches.end());
+      if (declFnTy->matchesFunctionType(parentDeclFnTy, matchMode,
+                                        paramsAndResultMatch)) {
+        matches.push_back({parentDecl, false});
+        continue;
+      }
+    } else if (getDeclComparisonType()->matches(parentDeclTy, matchMode)) {
+      matches.push_back({parentDecl, false});
+      continue;
+    }
+  }
 
-  // If we override more than one declaration, complain.
+  // If we have more than one match, and any of them was exact, remove all
+  // non-exact matches.
   if (matches.size() > 1) {
-    diagnoseGeneralOverrideFailure(decl, matches, attempt);
-    return true;
-  }
-
-  // If we have a single match (exact or not), take it.
-  auto matchDecl = matches.front().Decl;
-  auto matchType = matches.front().SubstType;
-  bool emittedMatchError = false;
-
-  // If the name of our match differs from the name we were looking for,
-  // complain.
-  if (decl->getFullName() != matchDecl->getFullName()) {
-    auto diag = TC.diagnose(decl, diag::override_argument_name_mismatch,
-                            isa<ConstructorDecl>(decl),
-                            decl->getFullName(),
-                            matchDecl->getFullName());
-    fixDeclarationName(diag, cast<AbstractFunctionDecl>(decl),
-                       matchDecl->getFullName());
-    emittedMatchError = true;
-  }
-
-  // If we have an explicit ownership modifier and our parent doesn't,
-  // complain.
-  auto parentAttr =
-      matchDecl->getAttrs().getAttribute<ReferenceOwnershipAttr>();
-  if (auto ownershipAttr =
-          decl->getAttrs().getAttribute<ReferenceOwnershipAttr>()) {
-    ReferenceOwnership parentOwnership;
-    if (parentAttr)
-      parentOwnership = parentAttr->get();
-    else
-      parentOwnership = ReferenceOwnership::Strong;
-    if (parentOwnership != ownershipAttr->get()) {
-      TC.diagnose(decl, diag::override_ownership_mismatch,
-                  parentOwnership, ownershipAttr->get());
-      TC.diagnose(matchDecl, diag::overridden_here);
+    bool hadExactMatch = std::find_if(matches.begin(), matches.end(),
+                                      [](const OverrideMatch &match) {
+                                        return match.IsExact;
+                                      }) != matches.end();
+    if (hadExactMatch) {
+      matches.erase(std::remove_if(matches.begin(), matches.end(),
+                                   [&](const OverrideMatch &match) {
+                                     return !match.IsExact;
+                                   }),
+                    matches.end());
     }
   }
 
-  // If a super method returns Self, and the subclass overrides it to
-  // instead return the subclass type, complain.
-  // This case gets this far because the type matching above specifically
-  // strips out dynamic self via replaceCovariantResultType(), and that
-  // is helpful in several cases - just not this one.
-  if (decl->getASTContext().isSwiftVersionAtLeast(5) &&
-      matchDecl->getInterfaceType()->hasDynamicSelfType() &&
-      !decl->getInterfaceType()->hasDynamicSelfType() &&
-      !classDecl->isFinal()) {
-    TC.diagnose(decl, diag::override_dynamic_self_mismatch);
-    TC.diagnose(matchDecl, diag::overridden_here);
-  }
+  return matches;
+}
+
+static void checkOverrideAccessControl(ValueDecl *baseDecl, ValueDecl *decl,
+                                       ASTContext &ctx) {
+  if (ctx.isAccessControlDisabled())
+    return;
+
+  auto &diags = ctx.Diags;
+
+  auto dc = decl->getDeclContext();
+  auto classDecl = dc->getSelfClassDecl();
+
+  bool isAccessor = isa<AccessorDecl>(decl);
 
   // Check that the override has the required access level.
   // Overrides have to be at least as accessible as what they
@@ -816,30 +844,38 @@ bool swift::checkOverrides(TypeChecker &TC, ValueDecl *decl) {
   // defining module.  This is not required for constructors, which are
   // never really "overridden" in the intended sense here, because of
   // course derived classes will change how the class is initialized.
-  AccessLevel matchAccess = matchDecl->getFormalAccess(dc);
-  if (matchAccess < AccessLevel::Open &&
-      matchDecl->getModuleContext() != decl->getModuleContext() &&
-      !isa<ConstructorDecl>(decl)) {
-    TC.diagnose(decl, diag::override_of_non_open,
-                decl->getDescriptiveKind());
-
-  } else if (matchAccess == AccessLevel::Open &&
-             classDecl->getFormalAccess(dc) ==
-               AccessLevel::Open &&
-             decl->getFormalAccess() != AccessLevel::Open &&
+  bool baseHasOpenAccess = baseDecl->hasOpenAccess(dc);
+  if (!isAccessor &&
+      !baseHasOpenAccess &&
+      baseDecl->getModuleContext() != decl->getModuleContext() &&
+      !isa<ConstructorDecl>(decl) &&
+      !isa<ProtocolDecl>(decl->getDeclContext())) {
+    // NSObject.hashValue was made non-overridable in Swift 5; one should
+    // override NSObject.hash instead.
+    if (isNSObjectHashValue(baseDecl)) {
+      diags.diagnose(decl, diag::override_nsobject_hashvalue_error)
+        .fixItReplace(SourceRange(decl->getNameLoc()), "hash");
+    } else {
+      diags.diagnose(decl, diag::override_of_non_open,
+                     decl->getDescriptiveKind());
+    }
+  } else if (baseHasOpenAccess &&
+             classDecl->hasOpenAccess(dc) &&
+             decl->getFormalAccess() < AccessLevel::Public &&
              !decl->isFinal()) {
     {
-      auto diag = TC.diagnose(decl, diag::override_not_accessible,
-                              /*setter*/false,
-                              decl->getDescriptiveKind(),
-                              /*fromOverridden*/true);
+      auto diag = diags.diagnose(decl, diag::override_not_accessible,
+                                 /*setter*/false,
+                                 decl->getDescriptiveKind(),
+                                 /*fromOverridden*/true);
       fixItAccess(diag, decl, AccessLevel::Open);
     }
-    TC.diagnose(matchDecl, diag::overridden_here);
+    diags.diagnose(baseDecl, diag::overridden_here);
 
-  } else if (!isa<ConstructorDecl>(decl)) {
+  } else if (!isa<ConstructorDecl>(decl) &&
+             !isa<ProtocolDecl>(decl->getDeclContext())) {
     auto matchAccessScope =
-      matchDecl->getFormalAccessScope(dc);
+      baseDecl->getFormalAccessScope(dc);
     auto classAccessScope =
       classDecl->getFormalAccessScope(dc);
     auto requiredAccessScope =
@@ -849,9 +885,13 @@ bool swift::checkOverrides(TypeChecker &TC, ValueDecl *decl) {
     bool shouldDiagnose = !decl->isAccessibleFrom(scopeDC);
 
     bool shouldDiagnoseSetter = false;
-    if (!shouldDiagnose && matchDecl->isSettable(dc)){
-      auto matchASD = cast<AbstractStorageDecl>(matchDecl);
+    if (!shouldDiagnose && baseDecl->isSettable(dc)){
+      auto matchASD = cast<AbstractStorageDecl>(baseDecl);
       if (matchASD->isSetterAccessibleFrom(dc)) {
+        // Match sure we've created the setter.
+        if (!matchASD->getSetter())
+          maybeAddAccessorsToStorage(matchASD);
+
         auto matchSetterAccessScope = matchASD->getSetter()
           ->getFormalAccessScope(dc);
         auto requiredSetterAccessScope =
@@ -868,20 +908,72 @@ bool swift::checkOverrides(TypeChecker &TC, ValueDecl *decl) {
     if (shouldDiagnose || shouldDiagnoseSetter) {
       bool overriddenForcesAccess =
         (requiredAccessScope->hasEqualDeclContextWith(matchAccessScope) &&
-         matchAccess != AccessLevel::Open);
+         !baseHasOpenAccess);
       AccessLevel requiredAccess =
         requiredAccessScope->requiredAccessForDiagnostics();
       {
-        auto diag = TC.diagnose(decl, diag::override_not_accessible,
-                                shouldDiagnoseSetter,
-                                decl->getDescriptiveKind(),
-                                overriddenForcesAccess);
-        fixItAccess(diag, decl, requiredAccess,
-                           shouldDiagnoseSetter);
+        auto diag = diags.diagnose(decl, diag::override_not_accessible,
+                                   shouldDiagnoseSetter,
+                                   decl->getDescriptiveKind(),
+                                   overriddenForcesAccess);
+        fixItAccess(diag, decl, requiredAccess, shouldDiagnoseSetter);
       }
-      TC.diagnose(matchDecl, diag::overridden_here);
+      diags.diagnose(baseDecl, diag::overridden_here);
     }
   }
+}
+
+bool OverrideMatcher::checkOverride(ValueDecl *baseDecl,
+                                    OverrideCheckingAttempt attempt) {
+  auto &diags = ctx.Diags;
+  auto baseTy = getMemberTypeForComparison(ctx, baseDecl, decl);
+  bool emittedMatchError = false;
+
+  // If the name of our match differs from the name we were looking for,
+  // complain.
+  if (decl->getFullName() != baseDecl->getFullName()) {
+    auto diag = diags.diagnose(decl, diag::override_argument_name_mismatch,
+                               isa<ConstructorDecl>(decl),
+                               decl->getFullName(),
+                               baseDecl->getFullName());
+    fixDeclarationName(diag, decl, baseDecl->getFullName());
+    emittedMatchError = true;
+  }
+
+  // If we have an explicit ownership modifier and our parent doesn't,
+  // complain.
+  auto parentAttr =
+      baseDecl->getAttrs().getAttribute<ReferenceOwnershipAttr>();
+  if (auto ownershipAttr =
+          decl->getAttrs().getAttribute<ReferenceOwnershipAttr>()) {
+    ReferenceOwnership parentOwnership;
+    if (parentAttr)
+      parentOwnership = parentAttr->get();
+    else
+      parentOwnership = ReferenceOwnership::Strong;
+    if (parentOwnership != ownershipAttr->get()) {
+      diags.diagnose(decl, diag::override_ownership_mismatch,
+                     parentOwnership, ownershipAttr->get());
+      diags.diagnose(baseDecl, diag::overridden_here);
+    }
+  }
+
+  // If a super method returns Self, and the subclass overrides it to
+  // instead return the subclass type, complain.
+  // This case gets this far because the type matching above specifically
+  // strips out dynamic self via replaceCovariantResultType(), and that
+  // is helpful in several cases - just not this one.
+  auto dc = decl->getDeclContext();
+  auto classDecl = dc->getSelfClassDecl();
+  if (decl->getASTContext().isSwiftVersionAtLeast(5) &&
+      baseDecl->getInterfaceType()->hasDynamicSelfType() &&
+      !decl->getInterfaceType()->hasDynamicSelfType() &&
+      !classDecl->isFinal()) {
+    diags.diagnose(decl, diag::override_dynamic_self_mismatch);
+    diags.diagnose(baseDecl, diag::overridden_here);
+  }
+
+  checkOverrideAccessControl(baseDecl, decl, ctx);
 
   bool mayHaveMismatchedOptionals =
       (attempt == OverrideCheckingAttempt::MismatchedOptional ||
@@ -890,73 +982,77 @@ bool swift::checkOverrides(TypeChecker &TC, ValueDecl *decl) {
   auto declIUOAttr =
       decl->getAttrs().hasAttribute<ImplicitlyUnwrappedOptionalAttr>();
   auto matchDeclIUOAttr =
-      matchDecl->getAttrs().hasAttribute<ImplicitlyUnwrappedOptionalAttr>();
+      baseDecl->getAttrs().hasAttribute<ImplicitlyUnwrappedOptionalAttr>();
 
   // If this is an exact type match, we're successful!
-  if (declIUOAttr == matchDeclIUOAttr && declTy->isEqual(matchType)) {
+  Type declTy = getDeclComparisonType();
+  Type owningTy = dc->getDeclaredInterfaceType();
+  if (declIUOAttr == matchDeclIUOAttr && declTy->isEqual(baseTy)) {
     // Nothing to do.
 
-  } else if (method) {
+  } else if (auto method = dyn_cast<AbstractFunctionDecl>(decl)) {
     if (attempt == OverrideCheckingAttempt::MismatchedTypes) {
       auto diagKind = diag::method_does_not_override;
-      if (ctor)
+      if (isa<ConstructorDecl>(method))
         diagKind = diag::initializer_does_not_override;
-      TC.diagnose(decl, diagKind);
-      noteFixableMismatchedTypes(decl, matchDecl);
-      TC.diagnose(matchDecl, diag::overridden_near_match_here,
-                  matchDecl->getDescriptiveKind(),
-                  matchDecl->getFullName());
+      diags.diagnose(decl, diagKind);
+      noteFixableMismatchedTypes(decl, baseDecl);
+      diags.diagnose(baseDecl, diag::overridden_near_match_here,
+                     baseDecl->getDescriptiveKind(),
+                     baseDecl->getFullName());
       emittedMatchError = true;
 
     } else if (!isa<AccessorDecl>(method) &&
-               (matchDecl->isObjC() || mayHaveMismatchedOptionals)) {
+               (baseDecl->isObjC() || mayHaveMismatchedOptionals)) {
       // Private migration help for overrides of Objective-C methods.
       TypeLoc resultTL;
       if (auto *methodAsFunc = dyn_cast<FuncDecl>(method))
         resultTL = methodAsFunc->getBodyResultTypeLoc();
+
       emittedMatchError |= diagnoseMismatchedOptionals(
-          method, method->getParameterList(1), resultTL, matchDecl,
-          cast<AbstractFunctionDecl>(matchDecl)->getParameterList(1),
+          method, method->getParameters(), resultTL, baseDecl,
+          cast<AbstractFunctionDecl>(baseDecl)->getParameters(),
           owningTy, mayHaveMismatchedOptionals);
     }
-  } else if (auto subscript =
-               dyn_cast_or_null<SubscriptDecl>(abstractStorage)) {
+  } else if (auto subscript = dyn_cast<SubscriptDecl>(decl)) {
     // Otherwise, if this is a subscript, validate that covariance is ok.
     // If the parent is non-mutable, it's okay to be covariant.
-    auto parentSubscript = cast<SubscriptDecl>(matchDecl);
+    auto parentSubscript = cast<SubscriptDecl>(baseDecl);
     if (parentSubscript->getSetter()) {
-      TC.diagnose(subscript, diag::override_mutable_covariant_subscript,
-                  declTy, matchType);
-      TC.diagnose(matchDecl, diag::subscript_override_here);
+      diags.diagnose(subscript, diag::override_mutable_covariant_subscript,
+                     declTy, baseTy);
+      diags.diagnose(baseDecl, diag::subscript_override_here);
       return true;
     }
 
     if (attempt == OverrideCheckingAttempt::MismatchedTypes) {
-      TC.diagnose(decl, diag::subscript_does_not_override);
-      noteFixableMismatchedTypes(decl, matchDecl);
-      TC.diagnose(matchDecl, diag::overridden_near_match_here,
-                  matchDecl->getDescriptiveKind(),
-                  matchDecl->getFullName());
+      diags.diagnose(decl, diag::subscript_does_not_override);
+      noteFixableMismatchedTypes(decl, baseDecl);
+      diags.diagnose(baseDecl, diag::overridden_near_match_here,
+                     baseDecl->getDescriptiveKind(),
+                     baseDecl->getFullName());
       emittedMatchError = true;
 
     } else if (mayHaveMismatchedOptionals) {
       emittedMatchError |= diagnoseMismatchedOptionals(
           subscript, subscript->getIndices(),
-          subscript->getElementTypeLoc(), matchDecl,
-          cast<SubscriptDecl>(matchDecl)->getIndices(), owningTy,
+          subscript->getElementTypeLoc(), baseDecl,
+          cast<SubscriptDecl>(baseDecl)->getIndices(), owningTy,
           mayHaveMismatchedOptionals);
     }
-  } else if (auto property = dyn_cast_or_null<VarDecl>(abstractStorage)) {
+  } else if (auto property = dyn_cast<VarDecl>(decl)) {
     auto propertyTy = property->getInterfaceType();
-    auto parentPropertyTy = superclass->adjustSuperclassMemberDeclType(
-        matchDecl, decl, matchDecl->getInterfaceType());
+    auto parentPropertyTy = getSuperMemberDeclType(baseDecl);
 
-    if (!propertyTy->matches(parentPropertyTy,
+    CanType parentPropertyCanTy =
+      parentPropertyTy->getCanonicalType(
+        decl->getInnermostDeclContext()->getGenericSignatureOfContext());
+    if (!propertyTy->matches(parentPropertyCanTy,
                              TypeMatchFlags::AllowOverride)) {
-      TC.diagnose(property, diag::override_property_type_mismatch,
-                  property->getName(), propertyTy, parentPropertyTy);
-      noteFixableMismatchedTypes(decl, matchDecl);
-      TC.diagnose(matchDecl, diag::property_override_here);
+      diags.diagnose(property, diag::override_property_type_mismatch,
+                     property->getName(), propertyTy, parentPropertyTy);
+      noteFixableMismatchedTypes(decl, baseDecl);
+      diags.diagnose(baseDecl, diag::property_override_here);
       return true;
     }
 
@@ -969,22 +1065,158 @@ bool swift::checkOverrides(TypeChecker &TC, ValueDecl *decl) {
           IsSilentDifference = true;
 
     // The overridden property must not be mutable.
-    if (cast<AbstractStorageDecl>(matchDecl)->getSetter() &&
+    if (cast<AbstractStorageDecl>(baseDecl)->getSetter() &&
         !IsSilentDifference) {
-      TC.diagnose(property, diag::override_mutable_covariant_property,
+      diags.diagnose(property, diag::override_mutable_covariant_property,
                   property->getName(), parentPropertyTy, propertyTy);
-      TC.diagnose(matchDecl, diag::property_override_here);
+      diags.diagnose(baseDecl, diag::property_override_here);
       return true;
     }
   }
 
+  if (emittedMatchError)
+    return true;
+
   // Catch-all to make sure we don't silently accept something we shouldn't.
-  if (attempt != OverrideCheckingAttempt::PerfectMatch &&
-      !emittedMatchError) {
-    diagnoseGeneralOverrideFailure(decl, matches, attempt);
+  if (attempt != OverrideCheckingAttempt::PerfectMatch) {
+    OverrideMatch match{decl, /*isExact=*/false};
+    diagnoseGeneralOverrideFailure(decl, match, attempt);
   }
 
-  return recordOverride(TC, decl, matchDecl);
+  return checkSingleOverride(decl, baseDecl);
+}
+
+// Invalidate an existing "override" attribute or add a new invalid "override"
+// attribute, which will suppress additional checking.
+static void invalidateOverrideAttribute(ValueDecl *decl) {
+  auto overrideAttr = decl->getAttrs().getAttribute<OverrideAttr>(true);
+  if (!overrideAttr) {
+    overrideAttr = new (decl->getASTContext()) OverrideAttr(true);
+    decl->getAttrs().add(overrideAttr);
+  }
+
+  overrideAttr->setInvalid();
+}
+
+TinyPtrVector<ValueDecl *> OverrideMatcher::checkPotentialOverrides(
+                                    SmallVectorImpl<OverrideMatch> &matches,
+                                    OverrideCheckingAttempt attempt) {
+  // If we override more than one declaration from a class, complain.
+  if (matches.size() > 1 && decl->getDeclContext()->getSelfClassDecl()) {
+    diagnoseGeneralOverrideFailure(decl, matches, attempt);
+    return { };
+  }
+
+  // Check the matches. If any are ill-formed, drop them.
+  TinyPtrVector<ValueDecl *> overridden;
+  for (const auto &match : matches) {
+    if (checkOverride(match.Decl, attempt))
+      continue;
+
+    overridden.push_back(match.Decl);
+  }
+
+  // If there were no overrides, invalidate the "override" attribute.
+  if (overridden.empty())
+    invalidateOverrideAttribute(decl);
+
+  return overridden;
+}
+
+/// Determine which method or subscript this method or subscript overrides
+/// (if any).
+///
+/// \returns true if an error occurred.
+bool swift::checkOverrides(ValueDecl *decl) {
+  // If there is a @_nonoverride attribute, this does not override anything.
+  if (decl->getAttrs().hasAttribute<NonOverrideAttr>())
+    return false;
+
+  // If we already computed overridden declarations and either succeeded
+  // or invalidated the attribute, there's nothing more to do.
+  if (decl->overriddenDeclsComputed()) {
+    // If we computed an overridden declaration successfully, we're done.
+    if (decl->getOverriddenDecl())
+      return false;
+
+    // If we set the override attribute to "invalid", we already diagnosed
+    // something here.
+    if (decl->getAttrs().hasAttribute<OverrideAttr>(/*AllowInvalid=*/true) &&
+        !decl->getAttrs().hasAttribute<OverrideAttr>())
+      return true;
+
+    // Otherwise, we have more checking to do.
+  }
+
+  // Accessor methods get overrides through their storage declaration, and
+  // all checking can be performed via that mechanism.
+  if (isa<AccessorDecl>(decl)) {
+    (void)decl->getOverriddenDecls();
+    return false;
+  }
+
+  // Set up matching, but bail out if there's nothing to match.
+  OverrideMatcher matcher(decl);
+  if (!matcher) return false;
+
+  // Look for members with the same name and matching types as this
+  // one.
+  SmallVector<OverrideMatch, 2> matches;
+  auto attempt = OverrideCheckingAttempt::PerfectMatch;
+  do {
+    // Determine whether we should attempt to perform matching now, or exit
+    // early with a failure.
+    switch (attempt) {
+    case OverrideCheckingAttempt::PerfectMatch:
+      break;
+    case OverrideCheckingAttempt::MismatchedOptional:
+      // Don't keep looking if the user didn't indicate it's an override.
+      if (!decl->getAttrs().hasAttribute<OverrideAttr>())
+        return false;
+      break;
+    case OverrideCheckingAttempt::MismatchedTypes:
+      break;
+    case OverrideCheckingAttempt::BaseName:
+      // Don't keep looking if this is already a simple name, or if there
+      // are no arguments.
+      if (decl->getFullName() == decl->getBaseName() ||
+          decl->getFullName().getArgumentNames().empty())
+        return false;
+      break;
+    case OverrideCheckingAttempt::BaseNameWithMismatchedOptional:
+      break;
+    case OverrideCheckingAttempt::Final:
+      // Give up.
+      return false;
+    }
+
+    // Try to match with this attempt kind.
+    matches = matcher.match(attempt);
+    if (!matches.empty())
+      break;
+
+    // If we're computing implicit overrides for a protocol member, don't
+    // look any further unless there's an `override` attribute.
+    if (matcher.isProtocolOverride() &&
+        !decl->getAttrs().hasAttribute<OverrideAttr>())
+      return false;
+
+    // Try the next version.
+    ++attempt;
+  } while (true);
+
+  assert(!matches.empty());
+
+  // FIXME: Check for missing 'override' keyword here?
+
+  // We performed override checking, so record the overrides.
+  // FIXME: It's weird to be pushing state here, but how do we say that
+  // this check subsumes the normal 'override' check?
+  auto overridden = matcher.checkPotentialOverrides(matches, attempt);
+  if (overridden.empty())
+    invalidateOverrideAttribute(decl);
+  decl->setOverriddenDecls(overridden);
+  return false;
 }
 
 namespace  {
@@ -1014,8 +1246,12 @@ namespace  {
 
     UNINTERESTING_ATTR(AccessControl)
     UNINTERESTING_ATTR(Alignment)
+    UNINTERESTING_ATTR(AlwaysEmitIntoClient)
+    UNINTERESTING_ATTR(Borrowed)
     UNINTERESTING_ATTR(CDecl)
     UNINTERESTING_ATTR(Consuming)
+    UNINTERESTING_ATTR(Dynamic)
+    UNINTERESTING_ATTR(DynamicCallable)
     UNINTERESTING_ATTR(DynamicMemberLookup)
     UNINTERESTING_ATTR(SILGenName)
     UNINTERESTING_ATTR(Exported)
@@ -1030,13 +1266,14 @@ namespace  {
     UNINTERESTING_ATTR(Optimize)
     UNINTERESTING_ATTR(Inlinable)
     UNINTERESTING_ATTR(Effects)
+    UNINTERESTING_ATTR(Final)
     UNINTERESTING_ATTR(FixedLayout)
     UNINTERESTING_ATTR(Lazy)
     UNINTERESTING_ATTR(LLDBDebuggerFunction)
     UNINTERESTING_ATTR(Mutating)
     UNINTERESTING_ATTR(NonMutating)
     UNINTERESTING_ATTR(NonObjC)
-    UNINTERESTING_ATTR(NoReturn)
+    UNINTERESTING_ATTR(NonOverride)
     UNINTERESTING_ATTR(NSApplicationMain)
     UNINTERESTING_ATTR(NSCopying)
     UNINTERESTING_ATTR(NSManaged)
@@ -1048,6 +1285,7 @@ namespace  {
     UNINTERESTING_ATTR(Convenience)
     UNINTERESTING_ATTR(Semantics)
     UNINTERESTING_ATTR(SetterAccess)
+    UNINTERESTING_ATTR(HasStorage)
     UNINTERESTING_ATTR(UIApplicationMain)
     UNINTERESTING_ATTR(UsableFromInline)
     UNINTERESTING_ATTR(ObjCNonLazyRealization)
@@ -1055,6 +1293,8 @@ namespace  {
     UNINTERESTING_ATTR(SwiftNativeObjCRuntimeBase)
     UNINTERESTING_ATTR(ShowInInterface)
     UNINTERESTING_ATTR(Specialize)
+    UNINTERESTING_ATTR(DynamicReplacement)
+    UNINTERESTING_ATTR(PrivateImport)
 
     // These can't appear on overridable declarations.
     UNINTERESTING_ATTR(Prefix)
@@ -1065,7 +1305,6 @@ namespace  {
     UNINTERESTING_ATTR(SynthesizedProtocol)
     UNINTERESTING_ATTR(RequiresStoredPropertyInits)
     UNINTERESTING_ATTR(Transparent)
-    UNINTERESTING_ATTR(SILStored)
     UNINTERESTING_ATTR(Testable)
 
     UNINTERESTING_ATTR(WarnUnqualifiedAccess)
@@ -1076,11 +1315,11 @@ namespace  {
     UNINTERESTING_ATTR(RestatedObjCConformance)
     UNINTERESTING_ATTR(Implements)
     UNINTERESTING_ATTR(StaticInitializeObjCMetadata)
-    UNINTERESTING_ATTR(DowngradeExhaustivityCheck)
     UNINTERESTING_ATTR(ImplicitlyUnwrappedOptional)
     UNINTERESTING_ATTR(ClangImporterSynthesizedType)
     UNINTERESTING_ATTR(WeakLinked)
     UNINTERESTING_ATTR(Frozen)
+    UNINTERESTING_ATTR(HasInitialValue)
 #undef UNINTERESTING_ATTR
 
     void visitAvailableAttr(AvailableAttr *attr) {
@@ -1098,42 +1337,6 @@ namespace  {
                        isa<ConstructorDecl>(Override));
         Diags.diagnose(Base, diag::overridden_here);
       }
-    }
-
-    void visitFinalAttr(FinalAttr *attr) {
-      // If this is an accessor, don't complain if we would have
-      // complained about the storage declaration.
-      if (auto accessor = dyn_cast<AccessorDecl>(Override)) {
-        if (auto storageDecl = accessor->getStorage()) {
-          if (storageDecl->getOverriddenDecl() &&
-              storageDecl->getOverriddenDecl()->isFinal())
-            return;
-        }
-      }
-
-      // FIXME: Customize message to the kind of thing.
-      auto baseKind = Base->getDescriptiveKind();
-      switch (baseKind) {
-      case DescriptiveDeclKind::StaticLet:
-      case DescriptiveDeclKind::StaticVar:
-      case DescriptiveDeclKind::StaticMethod:
-        Diags.diagnose(Override, diag::override_static, baseKind);
-        break;
-      default:
-        Diags.diagnose(Override, diag::override_final,
-                       Override->getDescriptiveKind(), baseKind);
-        break;
-      }
-
-      Diags.diagnose(Base, diag::overridden_here);
-    }
-
-    void visitDynamicAttr(DynamicAttr *attr) {
-      // Final overrides are not dynamic.
-      if (Override->isFinal())
-        return;
-
-      makeDynamic(Override->getASTContext(), Override);
     }
 
     void visitObjCAttr(ObjCAttr *attr) {
@@ -1165,7 +1368,7 @@ namespace  {
                      Override->getDescriptiveKind(),
                      Override->getFullName(),
                      Base->getDeclContext()
-                       ->getAsNominalTypeOrNominalTypeExtensionContext()
+                       ->getSelfNominalTypeDecl()
                        ->getName());
       Diags.diagnose(Base, diag::make_decl_objc, Base->getDescriptiveKind())
         .fixItInsert(Base->getAttributeInsertionLoc(false),
@@ -1175,15 +1378,27 @@ namespace  {
 } // end anonymous namespace
 
 /// Determine whether overriding the given declaration requires a keyword.
-bool swift::overrideRequiresKeyword(ValueDecl *overridden) {
-  if (auto ctor = dyn_cast<ConstructorDecl>(overridden)) {
-    return ctor->isDesignatedInit() && !ctor->isRequired();
+OverrideRequiresKeyword swift::overrideRequiresKeyword(ValueDecl *overridden) {
+  if (isa<AccessorDecl>(overridden))
+    return OverrideRequiresKeyword::Never;
+
+  if (isa<ProtocolDecl>(overridden->getDeclContext())) {
+    if (overridden->getASTContext().LangOpts.WarnImplicitOverrides)
+      return OverrideRequiresKeyword::Implicit;
+
+    return OverrideRequiresKeyword::Never;
   }
 
-  return true;
+  if (auto ctor = dyn_cast<ConstructorDecl>(overridden)) {
+    return !ctor->isDesignatedInit() || ctor->isRequired()
+      ? OverrideRequiresKeyword::Never
+      : OverrideRequiresKeyword::Always;
+  }
+
+  return OverrideRequiresKeyword::Always;
 }
 
-/// \brief Returns true if the availability of the overriding declaration
+/// Returns true if the availability of the overriding declaration
 /// makes it a safe override, given the availability of the base declaration.
 static bool isAvailabilitySafeForOverride(ValueDecl *override,
                                           ValueDecl *base) {
@@ -1236,14 +1451,31 @@ isRedundantAccessorOverrideAvailabilityDiagnostic(ValueDecl *override,
   };
 
   // If we have already emitted a diagnostic about an unsafe override
-  // for a getter or a setter, no need to complain about materializeForSet,
-  // which is synthesized to be as available as both the getter and
-  // the setter.
-  if (overrideFn->isMaterializeForSet()) {
+  // for a getter or a setter, no need to complain about the read or
+  // modify coroutines, which are synthesized to be as available as either
+  // the getter and the setter.
+  switch (overrideFn->getAccessorKind()) {
+  case AccessorKind::Get:
+  case AccessorKind::Set:
+    break;
+
+  case AccessorKind::Read:
+    if (accessorOverrideAlreadyDiagnosed(AccessorKind::Get))
+      return true;
+    break;
+
+  case AccessorKind::Modify:
     if (accessorOverrideAlreadyDiagnosed(AccessorKind::Get) ||
         accessorOverrideAlreadyDiagnosed(AccessorKind::Set)) {
       return true;
     }
+    break;
+
+#define OPAQUE_ACCESSOR(ID, KEYWORD)
+#define ACCESSOR(ID) \
+  case AccessorKind::ID:
+#include "swift/AST/AccessorKinds.def"
+    llvm_unreachable("checking override for non-opaque accessor");
   }
 
   return false;
@@ -1277,8 +1509,13 @@ static bool diagnoseOverrideForAvailability(ValueDecl *override,
   return true;
 }
 
-static bool recordOverride(TypeChecker &TC, ValueDecl *override,
-                           ValueDecl *base, bool isKnownObjC) {
+static bool checkSingleOverride(ValueDecl *override, ValueDecl *base) {
+  // This can happen with circular inheritance.
+  // FIXME: This shouldn't be possible once name lookup goes through the
+  // request-evaluator.
+  if (override == base)
+    return true;
+
   ASTContext &ctx = override->getASTContext();
   auto &diags = ctx.Diags;
 
@@ -1287,7 +1524,8 @@ static bool recordOverride(TypeChecker &TC, ValueDecl *override,
     auto *overrideASD = cast<AbstractStorageDecl>(override);
 
     // Make sure that the overriding property doesn't have storage.
-    if (overrideASD->hasStorage() &&
+    if ((overrideASD->hasStorage() ||
+         overrideASD->getAttrs().hasAttribute<LazyAttr>()) &&
         !(overrideASD->getWillSetFunc() || overrideASD->getDidSetFunc())) {
       bool downgradeToWarning = false;
       if (!ctx.isSwiftVersionAtLeast(5) &&
@@ -1311,7 +1549,7 @@ static bool recordOverride(TypeChecker &TC, ValueDecl *override,
     // read-only.  Observing properties look at change, read-only properties
     // have nothing to observe!
     bool baseIsSettable = baseASD->isSettable(baseASD->getDeclContext());
-    if (baseIsSettable && ctx.LangOpts.EnableAccessControl) {
+    if (baseIsSettable) {
       baseIsSettable =
          baseASD->isSetterAccessibleFrom(overrideASD->getDeclContext());
     }
@@ -1347,14 +1585,27 @@ static bool recordOverride(TypeChecker &TC, ValueDecl *override,
     }
   }
 
+  // Various properties are only checked for the storage declarations
+  // and not for the individual accessors. Otherwise, we end up with
+  // duplicated diagnostics.
+  bool isAccessor = isa<AccessorDecl>(override);
+
   // Non-Objective-C declarations in extensions cannot override or
   // be overridden.
-  if ((base->getDeclContext()->isExtensionContext() ||
-       override->getDeclContext()->isExtensionContext()) &&
-      !base->isObjC() && !isKnownObjC) {
-    bool baseCanBeObjC = TC.canBeRepresentedInObjC(base);
+  if (!isAccessor &&
+      (isa<ExtensionDecl>(base->getDeclContext()) ||
+       isa<ExtensionDecl>(override->getDeclContext())) &&
+      !base->isObjC()) {
+    // Suppress this diagnostic for overrides of a non-open NSObject.hashValue
+    // property; these are diagnosed elsewhere. An error message complaining
+    // about extensions would be misleading in this case; the correct fix is to
+    // override NSObject.hash instead.
+    if (isNSObjectHashValue(base) && 
+        !base->hasOpenAccess(override->getDeclContext()))
+      return true;
+    bool baseCanBeObjC = canBeRepresentedInObjC(base);
     diags.diagnose(override, diag::override_decl_extension, baseCanBeObjC,
-                   !base->getDeclContext()->isExtensionContext());
+                   !isa<ExtensionDecl>(base->getDeclContext()));
     if (baseCanBeObjC) {
       SourceLoc insertionLoc =
         override->getAttributeInsertionLoc(/*forModifier=*/false);
@@ -1370,17 +1621,22 @@ static bool recordOverride(TypeChecker &TC, ValueDecl *override,
   // If the overriding declaration does not have the 'override' modifier on
   // it, complain.
   if (!override->getAttrs().hasAttribute<OverrideAttr>() &&
-      overrideRequiresKeyword(base)) {
+      overrideRequiresKeyword(base) != OverrideRequiresKeyword::Never &&
+      !override->isImplicit() &&
+      override->getDeclContext()->getParentSourceFile()) {
     // FIXME: rdar://16320042 - For properties, we don't have a useful
     // location for the 'var' token.  Instead of emitting a bogus fixit, only
     // emit the fixit for 'func's.
+    auto theDiag =
+      overrideRequiresKeyword(base) == OverrideRequiresKeyword::Always
+        ? diag::missing_override
+        : diag::missing_override_warn;
     if (!isa<VarDecl>(override))
-      diags.diagnose(override, diag::missing_override)
+      diags.diagnose(override, theDiag)
           .fixItInsert(override->getStartLoc(), "override ");
     else
-      diags.diagnose(override, diag::missing_override);
+      diags.diagnose(override, theDiag);
     diags.diagnose(base, diag::overridden_here);
-    override->getAttrs().add(new (ctx) OverrideAttr(SourceLoc()));
   }
 
   // If the overridden method is declared in a Swift Class Declaration,
@@ -1390,13 +1646,11 @@ static bool recordOverride(TypeChecker &TC, ValueDecl *override,
   // FIXME: Only warn if the extension is in another module, and if
   // it is in the same module, update the vtable.
   if (auto *baseDecl = dyn_cast<ClassDecl>(base->getDeclContext())) {
-    if (baseDecl->hasKnownSwiftImplementation() &&
-        !base->isDynamic() && !isKnownObjC &&
-        override->getDeclContext()->isExtensionContext()) {
-      // For compatibility, only generate a warning in Swift 3
-      diags.diagnose(override, (ctx.isSwiftVersion3()
-        ? diag::override_class_declaration_in_extension_warning
-        : diag::override_class_declaration_in_extension));
+    if (!isAccessor &&
+        baseDecl->hasKnownSwiftImplementation() &&
+        !base->isObjCDynamic() &&
+        isa<ExtensionDecl>(override->getDeclContext())) {
+      diags.diagnose(override, diag::override_class_declaration_in_extension);
       diags.diagnose(base, diag::overridden_here);
     }
   }
@@ -1418,6 +1672,26 @@ static bool recordOverride(TypeChecker &TC, ValueDecl *override,
     }
   }
 
+  // The overridden declaration cannot be 'final'.
+  if (base->isFinal() && !isAccessor) {
+    // FIXME: Customize message to the kind of thing.
+    auto baseKind = base->getDescriptiveKind();
+    switch (baseKind) {
+    case DescriptiveDeclKind::StaticProperty:
+    case DescriptiveDeclKind::StaticMethod:
+      override->diagnose(diag::override_static, baseKind);
+      break;
+    default:
+      override->diagnose(diag::override_final,
+                         override->getDescriptiveKind(), baseKind);
+      break;
+    }
+
+    base->diagnose(diag::overridden_here);
+
+    return true;
+  }
+
   // FIXME: Possibly should extend to more availability checking.
   if (auto *attr = base->getAttrs().getUnavailable(ctx)) {
     diagnoseUnavailableOverride(override, base, attr);
@@ -1427,61 +1701,21 @@ static bool recordOverride(TypeChecker &TC, ValueDecl *override,
     diagnoseOverrideForAvailability(override, base);
   }
 
+  // Overrides of NSObject.hashValue are deprecated; one should override
+  // NSObject.hash instead.
+  // FIXME: Remove this when NSObject.hashValue becomes non-open in
+  // swift-corelibs-foundation.
+  if (isNSObjectHashValue(base) &&
+      base->hasOpenAccess(override->getDeclContext())) {
+    override->diagnose(diag::override_nsobject_hashvalue_warning)
+      .fixItReplace(SourceRange(override->getNameLoc()), "hash");
+  }
+
   /// Check attributes associated with the base; some may need to merged with
   /// or checked against attributes in the overriding declaration.
   AttributeOverrideChecker attrChecker(base, override);
   for (auto attr : base->getAttrs()) {
     attrChecker.visit(attr);
-  }
-
-  if (auto overridingFunc = dyn_cast<FuncDecl>(override)) {
-    overridingFunc->setOverriddenDecl(cast<FuncDecl>(base));
-  } else if (auto overridingCtor = dyn_cast<ConstructorDecl>(override)) {
-    overridingCtor->setOverriddenDecl(cast<ConstructorDecl>(base));
-  } else if (auto overridingASD = dyn_cast<AbstractStorageDecl>(override)) {
-    auto *baseASD = cast<AbstractStorageDecl>(base);
-    overridingASD->setOverriddenDecl(baseASD);
-
-    // Make sure we get consistent overrides for the accessors as well.
-    assert(baseASD->getGetter());
-
-    auto recordAccessorOverride = [&](AccessorKind kind) {
-      // We need the same accessor on both.
-      auto baseAccessor = baseASD->getAccessor(kind);
-      if (!baseAccessor) return;
-      auto overridingAccessor = overridingASD->getAccessor(kind);
-      if (!overridingAccessor) return;
-
-      // For setter accessors, we need the base's setter to be
-      // accessible from the overriding context, or it's not an override.
-      if ((kind == AccessorKind::Set ||
-           kind == AccessorKind::MaterializeForSet) &&
-          !baseASD->isSetterAccessibleFrom(overridingASD->getDeclContext()))
-        return;
-
-      // A materializeForSet for an override of storage with a
-      // forced static dispatch materializeForSet is not itself an
-      // override.
-      if (kind == AccessorKind::MaterializeForSet &&
-          baseAccessor->hasForcedStaticDispatch())
-        return;
-
-      // FIXME: Egregious hack to set an 'override' attribute.
-      if (!overridingAccessor->getAttrs().hasAttribute<OverrideAttr>()) {
-        auto loc = overridingASD->getOverrideLoc();
-        overridingAccessor->getAttrs().add(
-            new (ctx) OverrideAttr(loc));
-      }
-
-      recordOverride(TC, overridingAccessor, baseAccessor, baseASD->isObjC());
-    };
-
-    // FIXME: Another list of accessors, yay!
-    recordAccessorOverride(AccessorKind::Get);
-    recordAccessorOverride(AccessorKind::Set);
-    recordAccessorOverride(AccessorKind::MaterializeForSet);
-  } else {
-    llvm_unreachable("Unexpected decl");
   }
 
   return false;
@@ -1490,7 +1724,7 @@ static bool recordOverride(TypeChecker &TC, ValueDecl *override,
 /// Minimize the set of overridden associated types, eliminating any
 /// associated types that are overridden by other associated types.
 static void minimizeOverriddenAssociatedTypes(
-                           SmallVectorImpl<ValueDecl *> &assocTypes) {
+                           llvm::TinyPtrVector<ValueDecl *> &assocTypes) {
   // Mark associated types that are "worse" than some other associated type,
   // because they come from an inherited protocol.
   bool anyWorse = false;
@@ -1518,9 +1752,10 @@ static void minimizeOverriddenAssociatedTypes(
   // Copy in the associated types that aren't worse than any other associated
   // type.
   unsigned nextIndex = 0;
-  for (unsigned i : indices(assocTypes)) {
+  MutableArrayRef<ValueDecl *> buffer = assocTypes;
+  for (unsigned i : indices(buffer)) {
     if (worseThanAny[i]) continue;
-    assocTypes[nextIndex++] = assocTypes[i];
+    buffer[nextIndex++] = buffer[i];
   }
 
   assocTypes.erase(assocTypes.begin() + nextIndex, assocTypes.end());
@@ -1534,74 +1769,161 @@ static int compareSimilarAssociatedTypes(ValueDecl *const *lhs,
   return TypeDecl::compare(lhsProto, rhsProto);
 }
 
-void TypeChecker::resolveOverriddenDecl(ValueDecl *VD) {
-  // If this function or something it calls didn't set any overridden
-  // declarations, it means that there are no overridden declarations. Set
-  // the empty list.
-  // Note: the request-evaluator would do this for free, but this function
-  // is still fundamentally stateful.
-  SWIFT_DEFER {
-    if (!VD->overriddenDeclsComputed())
-      (void)VD->setOverriddenDecls({ });
-  };
+/// Compute the set of associated types that are overridden by the given
+/// associated type.
+static llvm::TinyPtrVector<ValueDecl *>
+computeOverriddenAssociatedTypes(AssociatedTypeDecl *assocType) {
+  // Find associated types with the given name in all of the inherited
+  // protocols.
+  llvm::TinyPtrVector<ValueDecl *> overriddenAssocTypes;
+  auto proto = assocType->getProtocol();
+  proto->walkInheritedProtocols([&](ProtocolDecl *inheritedProto) {
+    if (proto == inheritedProto) return TypeWalker::Action::Continue;
+
+    // Objective-C protocols
+    if (inheritedProto->isObjC()) return TypeWalker::Action::Continue;
+
+    // Look for associated types with the same name.
+    bool foundAny = false;
+    auto flags = OptionSet<NominalTypeDecl::LookupDirectFlags>();
+    flags |= NominalTypeDecl::LookupDirectFlags::IgnoreNewExtensions;
+    for (auto member : inheritedProto->lookupDirect(
+                                              assocType->getFullName(),
+                                              flags)) {
+      if (auto assocType = dyn_cast<AssociatedTypeDecl>(member)) {
+        overriddenAssocTypes.push_back(assocType);
+        foundAny = true;
+      }
+    }
+
+    return foundAny ? TypeWalker::Action::SkipChildren
+                    : TypeWalker::Action::Continue;
+  });
+
+  // Minimize the set of inherited associated types, eliminating any that
+  // themselves are overridden.
+  minimizeOverriddenAssociatedTypes(overriddenAssocTypes);
+
+  // Sort the set of inherited associated types.
+  llvm::array_pod_sort(overriddenAssocTypes.begin(),
+                       overriddenAssocTypes.end(),
+                       compareSimilarAssociatedTypes);
+
+  return overriddenAssocTypes;
+}
+
+llvm::Expected<llvm::TinyPtrVector<ValueDecl *>>
+OverriddenDeclsRequest::evaluate(Evaluator &evaluator, ValueDecl *decl) const {
+  // Value to return in error cases
+  auto noResults = llvm::TinyPtrVector<ValueDecl *>();
+
+  // If there is a @_nonoverride attribute, this does not override anything.
+  if (decl->getAttrs().hasAttribute<NonOverrideAttr>())
+    return noResults;
 
   // For an associated type, compute the (minimized) set of overridden
   // declarations.
-  if (auto assocType = dyn_cast<AssociatedTypeDecl>(VD)) {
-    // Assume there are no overridden declarations for the purposes of this
-    // computation.
-    // FIXME: The request-evaluator will eventually handle this for us.
-    (void)assocType->setOverriddenDecls({ });
-
-    // Find associated types with the given name in all of the inherited
-    // protocols.
-    SmallVector<ValueDecl *, 4> inheritedAssociatedTypes;
-    auto proto = assocType->getProtocol();
-    proto->walkInheritedProtocols([&](ProtocolDecl *inheritedProto) {
-      if (proto == inheritedProto) return TypeWalker::Action::Continue;
-
-      // Objective-C protocols
-      if (inheritedProto->isObjC()) return TypeWalker::Action::Continue;
-
-      // Look for associated types with the same name.
-      bool foundAny = false;
-      for (auto member : inheritedProto->lookupDirect(
-                                                      assocType->getFullName(),
-                                                      /*ignoreNewExtensions=*/true)) {
-        if (auto assocType = dyn_cast<AssociatedTypeDecl>(member)) {
-          inheritedAssociatedTypes.push_back(assocType);
-          foundAny = true;
-        }
-      }
-
-      return foundAny ? TypeWalker::Action::SkipChildren
-      : TypeWalker::Action::Continue;
-    });
-
-    // Minimize the set of inherited associated types, eliminating any that
-    // themselves are overridden.
-    minimizeOverriddenAssociatedTypes(inheritedAssociatedTypes);
-
-    // Sort the set of inherited associated types.
-    llvm::array_pod_sort(inheritedAssociatedTypes.begin(),
-                         inheritedAssociatedTypes.end(),
-                         compareSimilarAssociatedTypes);
-
-    (void)assocType->setOverriddenDecls(inheritedAssociatedTypes);
-    return;
+  if (auto assocType = dyn_cast<AssociatedTypeDecl>(decl)) {
+    return computeOverriddenAssociatedTypes(assocType);
   }
 
-  // Only members of classes can override other declarations.
-  if (!VD->getDeclContext()->getAsClassOrClassExtensionContext())
-    return;
+  // Only members of classes or protocols can override other declarations.
+  if (!decl->getDeclContext()->getSelfClassDecl() &&
+      !isa<ProtocolDecl>(decl->getDeclContext()))
+    return noResults;
 
   // Types that aren't associated types cannot be overridden.
-  if (isa<TypeDecl>(VD))
-    return;
+  if (isa<TypeDecl>(decl))
+    return noResults;
 
-  // FIXME: We should check for the 'override' or 'required' keywords
-  // here, to short-circuit checking in the common case.
+  // Accessors determine their overrides based on their abstract storage
+  // declarations.
+  if (auto accessor = dyn_cast<AccessorDecl>(decl)) {
+    auto overridingASD = accessor->getStorage();
 
-  // FIXME: We should perform more minimal validation.
-  validateDeclForNameLookup(VD);
+    // Check the various overridden storage declarations.
+    SmallVector<OverrideMatch, 2> matches;
+    for (auto overridden : overridingASD->getOverriddenDecls()) {
+      auto baseASD = cast<AbstractStorageDecl>(overridden);
+      maybeAddAccessorsToStorage(baseASD);
+
+      auto kind = accessor->getAccessorKind();
+
+      // If the base doesn't consider this an opaque accessor,
+      // this isn't really an override.
+      if (!baseASD->requiresOpaqueAccessor(kind))
+        continue;
+
+      // Find the base accessor; if there isn't one, we're done.
+      auto baseAccessor = baseASD->getAccessor(kind);
+      if (!baseAccessor) continue;
+
+      if (baseAccessor->hasForcedStaticDispatch())
+        continue;
+
+      switch (kind) {
+      case AccessorKind::Get:
+      case AccessorKind::Read:
+        break;
+
+      case AccessorKind::Modify:
+      case AccessorKind::Set:
+        // For setter accessors, we need the base's setter to be
+        // accessible from the overriding context, or it's not an override.
+        if (!baseASD->isSetterAccessibleFrom(overridingASD->getDeclContext()))
+          continue;
+        break;
+
+#define OPAQUE_ACCESSOR(ID, KEYWORD)
+#define ACCESSOR(ID) \
+      case AccessorKind::ID:
+#include "swift/AST/AccessorKinds.def"
+        llvm_unreachable("non-opaque accessor was required as opaque by base");
+      }
+
+      // We are overriding the base accessor.
+      matches.push_back({baseAccessor, /*IsExact=*/true});
+    }
+
+    if (matches.empty())
+      return noResults;
+
+    // Check the correctness of the overrides.
+    OverrideMatcher matcher(accessor);
+    return matcher.checkPotentialOverrides(
+                                       matches,
+                                       OverrideCheckingAttempt::PerfectMatch);
+  }
+
+  // Only initializers, declarations marked with the 'override' declaration
+  // modifier, and members of protocols can override declarations.
+  if (!isa<ConstructorDecl>(decl) &&
+      !isa<ProtocolDecl>(decl->getDeclContext()) &&
+      !decl->getAttrs().hasAttribute<OverrideAttr>())
+    return noResults;
+
+  // Try to match potential overridden declarations.
+  OverrideMatcher matcher(decl);
+  if (!matcher) {
+    return noResults;
+  }
+
+  auto matches = matcher.match(OverrideCheckingAttempt::PerfectMatch);
+  if (matches.empty()) {
+    return noResults;
+  }
+
+  // If we have more than one potential match from a class, diagnose the
+  // ambiguity and fail.
+  if (matches.size() > 1 && decl->getDeclContext()->getSelfClassDecl()) {
+    diagnoseGeneralOverrideFailure(decl, matches,
+                                   OverrideCheckingAttempt::PerfectMatch);
+    invalidateOverrideAttribute(decl);
+    return noResults;
+  }
+
+  // Check the matches. If any are ill-formed, invalidate the override attribute
+  // so we don't try again.
+  return matcher.checkPotentialOverrides(matches,
+                                         OverrideCheckingAttempt::PerfectMatch);
 }

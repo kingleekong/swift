@@ -171,15 +171,14 @@ void InvocationOptions::profile(llvm::FoldingSetNodeID &ID) const {
 namespace SourceKit {
   struct ASTUnit::Implementation {
     const uint64_t Generation;
-    SwiftStatistics &Stats;
+    std::shared_ptr<SwiftStatistics> Stats;
     SmallVector<ImmutableTextSnapshotRef, 4> Snapshots;
     EditorDiagConsumer CollectDiagConsumer;
     CompilerInstance CompInst;
-    OwnedResolver TypeResolver{ nullptr, nullptr };
     WorkQueue Queue{ WorkQueue::Dequeuing::Serial, "sourcekit.swift.ConsumeAST" };
 
-    Implementation(uint64_t Generation, SwiftStatistics &Statistics)
-        : Generation(Generation), Stats(Statistics) {}
+    Implementation(uint64_t Generation, std::shared_ptr<SwiftStatistics> Stats)
+        : Generation(Generation), Stats(Stats) {}
 
     void consumeAsync(SwiftASTConsumerRef ASTConsumer, ASTUnitRef ASTRef);
   };
@@ -200,14 +199,14 @@ namespace SourceKit {
     });
   }
 
-  ASTUnit::ASTUnit(uint64_t Generation, SwiftStatistics &Stats)
+  ASTUnit::ASTUnit(uint64_t Generation, std::shared_ptr<SwiftStatistics> Stats)
       : Impl(*new Implementation(Generation, Stats)) {
-    auto numASTs = ++Stats.numASTsInMem;
-    Stats.maxASTsInMem.updateMax(numASTs);
+    auto numASTs = ++Stats->numASTsInMem;
+    Stats->maxASTsInMem.updateMax(numASTs);
   }
 
   ASTUnit::~ASTUnit() {
-    --Impl.Stats.numASTsInMem;
+    --Impl.Stats->numASTsInMem;
     delete &Impl;
   }
 
@@ -283,7 +282,7 @@ public:
     return AST;
   }
 
-  void getASTUnitAsync(SwiftASTManager::Implementation &MgrImpl,
+  void getASTUnitAsync(std::shared_ptr<SwiftASTManager> Mgr,
                        ArrayRef<ImmutableTextSnapshotRef> Snapshots,
                 std::function<void(ASTUnitRef Unit, StringRef Error)> Receiver);
   bool shouldRebuild(SwiftASTManager::Implementation &MgrImpl,
@@ -347,13 +346,14 @@ struct CacheKeyHashInfo<ASTKey> {
 } // namespace swift
 
 struct SwiftASTManager::Implementation {
-  explicit Implementation(SwiftLangSupport &LangSupport)
-      : EditorDocs(LangSupport.getEditorDocuments()),
-        Stats(LangSupport.getStatistics()),
-        RuntimeResourcePath(LangSupport.getRuntimeResourcePath()) {}
+  explicit Implementation(
+      std::shared_ptr<SwiftEditorDocumentFileMap> EditorDocs,
+      std::shared_ptr<SwiftStatistics> Stats, StringRef RuntimeResourcePath)
+      : EditorDocs(EditorDocs), Stats(Stats),
+        RuntimeResourcePath(RuntimeResourcePath) {}
 
-  SwiftEditorDocumentFileMap &EditorDocs;
-  SwiftStatistics &Stats;
+  std::shared_ptr<SwiftEditorDocumentFileMap> EditorDocs;
+  std::shared_ptr<SwiftStatistics> Stats;
   std::string RuntimeResourcePath;
   SourceManager SourceMgr;
   Cache<ASTKey, ASTProducerRef> ASTCache{ "sourcekit.swift.ASTCache" };
@@ -370,9 +370,10 @@ struct SwiftASTManager::Implementation {
                                                       std::string &Error);
 };
 
-SwiftASTManager::SwiftASTManager(SwiftLangSupport &LangSupport)
-  : Impl(*new Implementation(LangSupport)) {
-}
+SwiftASTManager::SwiftASTManager(
+    std::shared_ptr<SwiftEditorDocumentFileMap> EditorDocs,
+    std::shared_ptr<SwiftStatistics> Stats, StringRef RuntimeResourcePath)
+    : Impl(*new Implementation(EditorDocs, Stats, RuntimeResourcePath)) {}
 
 SwiftASTManager::~SwiftASTManager() {
   delete &Impl;
@@ -430,15 +431,28 @@ bool SwiftASTManager::initCompilerInvocation(CompilerInvocation &Invocation,
                                              DiagnosticEngine &Diags,
                                              StringRef UnresolvedPrimaryFile,
                                              std::string &Error) {
-  SmallVector<const char *, 16> Args(OrigArgs.begin(), OrigArgs.end());
+  SmallVector<const char *, 16> Args;
+  // Make sure to put '-resource-dir' at the top to allow overriding it by
+  // the passed in arguments.
   Args.push_back("-resource-dir");
   Args.push_back(Impl.RuntimeResourcePath.c_str());
+  Args.append(OrigArgs.begin(), OrigArgs.end());
 
-  if (auto driverInvocation = driver::createCompilerInvocation(Args, Diags)) {
-    Invocation = *driverInvocation;
-  } else {
-    // FIXME: Get the actual diagnostic.
-    Error = "error when parsing the compiler arguments";
+  SmallString<32> ErrStr;
+  llvm::raw_svector_ostream ErrOS(ErrStr);
+  StreamDiagConsumer DiagConsumer(ErrOS);
+  Diags.addConsumer(DiagConsumer);
+
+  bool HadError = driver::getSingleFrontendInvocationFromDriverArguments(
+      Args, Diags, [&](ArrayRef<const char *> FrontendArgs) {
+    return Invocation.parseArgs(FrontendArgs, Diags);
+  });
+
+  // Remove the StreamDiagConsumer as it's no longer needed.
+  Diags.removeConsumer(DiagConsumer);
+
+  if (HadError) {
+    Error = ErrOS.str();
     return true;
   }
 
@@ -486,20 +500,9 @@ bool SwiftASTManager::initCompilerInvocation(CompilerInvocation &CompInvok,
                                              ArrayRef<const char *> OrigArgs,
                                              StringRef PrimaryFile,
                                              std::string &Error) {
-
-  SmallString<32> ErrStr;
-  llvm::raw_svector_ostream ErrOS(ErrStr);
   DiagnosticEngine Diagnostics(Impl.SourceMgr);
-  StreamDiagConsumer DiagConsumer(ErrOS);
-  Diagnostics.addConsumer(DiagConsumer);
-
-  if (initCompilerInvocation(CompInvok, OrigArgs, Diagnostics, PrimaryFile,
-                             Error)) {
-    if (!ErrOS.str().empty())
-      Error = ErrOS.str();
-    return true;
-  }
-  return false;
+  return initCompilerInvocation(CompInvok, OrigArgs, Diagnostics, PrimaryFile,
+                                Error);
 }
 
 bool SwiftASTManager::initCompilerInvocationNoInputs(
@@ -563,7 +566,7 @@ void SwiftASTManager::processASTAsync(SwiftInvocationRef InvokRef,
 
   if (ASTUnitRef Unit = Producer->getExistingAST()) {
     if (ASTConsumer->canUseASTWithSnapshots(Unit->getSnapshots())) {
-      ++Impl.Stats.numASTsUsedWithSnaphots;
+      ++Impl.Stats->numASTsUsedWithSnaphots;
       Unit->Impl.consumeAsync(std::move(ASTConsumer), Unit);
       return;
     }
@@ -589,7 +592,7 @@ void SwiftASTManager::processASTAsync(SwiftInvocationRef InvokRef,
     }
   };
 
-  Producer->getASTUnitAsync(Impl, Snapshots, std::move(handleAST));
+  Producer->getASTUnitAsync(shared_from_this(), Snapshots, std::move(handleAST));
 }
 
 void SwiftASTManager::removeCachedAST(SwiftInvocationRef Invok) {
@@ -618,7 +621,7 @@ static FileContent getFileContentFromSnap(ImmutableTextSnapshotRef Snap,
 FileContent SwiftASTManager::Implementation::getFileContent(
     StringRef UnresolvedPath, bool IsPrimary, std::string &Error) {
   std::string FilePath = SwiftLangSupport::resolvePathSymlinks(UnresolvedPath);
-  if (auto EditorDoc = EditorDocs.findByPath(FilePath))
+  if (auto EditorDoc = EditorDocs->findByPath(FilePath))
     return getFileContentFromSnap(EditorDoc->getLatestSnapshot(), IsPrimary,
                                   FilePath);
 
@@ -630,7 +633,7 @@ FileContent SwiftASTManager::Implementation::getFileContent(
 }
 
 BufferStamp SwiftASTManager::Implementation::getBufferStamp(StringRef FilePath){
-  if (auto EditorDoc = EditorDocs.findByPath(FilePath))
+  if (auto EditorDoc = EditorDocs->findByPath(FilePath))
     return EditorDoc->getLatestSnapshot()->getStamp();
 
   llvm::sys::fs::file_status Status;
@@ -657,7 +660,7 @@ SwiftASTManager::Implementation::getMemoryBuffer(StringRef Filename,
   return nullptr;
 }
 
-void ASTProducer::getASTUnitAsync(SwiftASTManager::Implementation &MgrImpl,
+void ASTProducer::getASTUnitAsync(std::shared_ptr<SwiftASTManager> Mgr,
                                   ArrayRef<ImmutableTextSnapshotRef> Snaps,
                std::function<void(ASTUnitRef Unit, StringRef Error)> Receiver) {
 
@@ -665,9 +668,9 @@ void ASTProducer::getASTUnitAsync(SwiftASTManager::Implementation &MgrImpl,
   SmallVector<ImmutableTextSnapshotRef, 4> Snapshots;
   Snapshots.append(Snaps.begin(), Snaps.end());
 
-  MgrImpl.ASTBuildQueue.dispatch([ThisProducer, &MgrImpl, Snapshots, Receiver] {
+  Mgr->Impl.ASTBuildQueue.dispatch([ThisProducer, Mgr, Snapshots, Receiver] {
     std::string Error;
-    ASTUnitRef Unit = ThisProducer->getASTUnitImpl(MgrImpl, Snapshots, Error);
+    ASTUnitRef Unit = ThisProducer->getASTUnitImpl(Mgr->Impl, Snapshots, Error);
     Receiver(Unit, Error);
   }, /*isStackDeep=*/true);
 }
@@ -703,7 +706,7 @@ ASTUnitRef ASTProducer::getASTUnitImpl(SwiftASTManager::Implementation &MgrImpl,
       MgrImpl.ASTCache.set(InvokRef->Impl.Key, ThisProducer);
     }
   } else {
-    ++MgrImpl.Stats.numASTCacheHits;
+    ++MgrImpl.Stats->numASTCacheHits;
   }
 
   return AST;
@@ -831,7 +834,7 @@ static std::atomic<uint64_t> ASTUnitGeneration{ 0 };
 ASTUnitRef ASTProducer::createASTUnit(SwiftASTManager::Implementation &MgrImpl,
                                       ArrayRef<ImmutableTextSnapshotRef> Snapshots,
                                       std::string &Error) {
-  ++MgrImpl.Stats.numASTBuilds;
+  ++MgrImpl.Stats->numASTBuilds;
 
   Stamps.clear();
   DependencyStamps.clear();
@@ -921,11 +924,6 @@ ASTUnitRef ASTProducer::createASTUnit(SwiftASTManager::Implementation &MgrImpl,
     }
   }
 
-  // We mirror the compiler and don't set the TypeResolver during SIL
-  // processing. This is to avoid unnecessary typechecking that can occur if the
-  // TypeResolver is set before.
-  ASTRef->Impl.TypeResolver = createLazyResolver(CompIns.getASTContext());
-
   return ASTRef;
 }
 
@@ -954,7 +952,7 @@ void ASTProducer::findSnapshotAndOpenFiles(
       LOG_WARN_FUNC("failed getting file contents for " << File << ": "
                                                         << Error);
       // File may not exist, continue and recover as if it was empty.
-      Content.Buffer = llvm::MemoryBuffer::getNewMemBuffer(0, File);
+      Content.Buffer = llvm::WritableMemoryBuffer::getNewMemBuffer(0, File);
     }
     Contents.push_back(std::move(Content));
   }

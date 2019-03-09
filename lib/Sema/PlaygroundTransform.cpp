@@ -280,7 +280,7 @@ public:
         BraceStmt *NB = transformBraceStmt(B);
         if (NB != B) {
           FD->setBody(NB);
-          TypeChecker(Context).checkFunctionErrorHandling(FD);
+          TypeChecker::createForContext(Context).checkFunctionErrorHandling(FD);
         }
       }
     } else if (auto *NTD = dyn_cast<NominalTypeDecl>(D)) {
@@ -705,7 +705,7 @@ public:
                          PatternBindingDecl *&ArgPattern,
                          VarDecl *&ArgVariable) {
     const char *LoggerName =
-        isDebugPrint ? "$builtin_debugPrint" : "$builtin_print";
+        isDebugPrint ? "__builtin_debugPrint" : "__builtin_print";
 
     UnresolvedDeclRefExpr *LoggerRef = new (Context) UnresolvedDeclRefExpr(
         Context.getIdentifier(LoggerName), DeclRefKind::Ordinary,
@@ -724,7 +724,7 @@ public:
   }
 
   Added<Stmt *> logPostPrint(SourceRange SR) {
-    return buildLoggerCallWithArgs("$builtin_postPrint",
+    return buildLoggerCallWithArgs("__builtin_postPrint",
                                    MutableArrayRef<Expr *>(), SR);
   }
 
@@ -749,8 +749,9 @@ public:
         new (Context) VarDecl(/*IsStatic*/false, VarDecl::Specifier::Let,
                               /*IsCaptureList*/false, SourceLoc(),
                               Context.getIdentifier(NameBuf),
-                              MaybeLoadInitExpr->getType(), TypeCheckDC);
-    VD->setInterfaceType(VD->getType()->mapTypeOutOfContext());
+                              TypeCheckDC);
+    VD->setType(MaybeLoadInitExpr->getType());
+    VD->setInterfaceType(MaybeLoadInitExpr->getType()->mapTypeOutOfContext());
     VD->setImplicit();
 
     NamedPattern *NP = new (Context) NamedPattern(VD, /*implicit*/ true);
@@ -775,7 +776,7 @@ public:
 
     Expr *LoggerArgExprs[] = {*E, NameExpr, IDExpr};
 
-    return buildLoggerCallWithArgs("$builtin_log_with_id",
+    return buildLoggerCallWithArgs("__builtin_log_with_id",
                                    MutableArrayRef<Expr *>(LoggerArgExprs), SR);
   }
 
@@ -789,7 +790,7 @@ public:
 
   Added<Stmt *> buildScopeCall(SourceRange SR, bool IsExit) {
     const char *LoggerName =
-        IsExit ? "$builtin_log_scope_exit" : "$builtin_log_scope_entry";
+        IsExit ? "__builtin_log_scope_exit" : "__builtin_log_scope_entry";
 
     return buildLoggerCallWithArgs(LoggerName, MutableArrayRef<Expr *>(), SR);
   }
@@ -849,7 +850,7 @@ public:
                                   AccessSemantics::Ordinary, Apply->getType());
 
     UnresolvedDeclRefExpr *SendDataRef = new (Context)
-        UnresolvedDeclRefExpr(Context.getIdentifier("$builtin_send_data"),
+        UnresolvedDeclRefExpr(Context.getIdentifier("__builtin_send_data"),
                               DeclRefKind::Ordinary, DeclNameLoc());
 
     SendDataRef->setImplicit(true);
@@ -892,7 +893,7 @@ void swift::performPlaygroundTransform(SourceFile &SF, bool HighPerformance) {
             BraceStmt *NewBody = I.transformBraceStmt(Body);
             if (NewBody != Body) {
               FD->setBody(NewBody);
-              TypeChecker(ctx).checkFunctionErrorHandling(FD);
+              TypeChecker::createForContext(ctx).checkFunctionErrorHandling(FD);
             }
             return false;
           }
@@ -905,7 +906,8 @@ void swift::performPlaygroundTransform(SourceFile &SF, bool HighPerformance) {
             BraceStmt *NewBody = I.transformBraceStmt(Body, true);
             if (NewBody != Body) {
               TLCD->setBody(NewBody);
-              TypeChecker(ctx).checkTopLevelErrorHandling(TLCD);
+              TypeChecker::createForContext(ctx)
+                .checkTopLevelErrorHandling(TLCD);
             }
             return false;
           }

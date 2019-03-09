@@ -13,11 +13,11 @@
 #ifndef SWIFT_DRIVER_JOB_H
 #define SWIFT_DRIVER_JOB_H
 
+#include "swift/Basic/FileTypes.h"
 #include "swift/Basic/LLVM.h"
+#include "swift/Basic/OutputFileMap.h"
 #include "swift/Driver/Action.h"
 #include "swift/Driver/Util.h"
-#include "swift/Frontend/FileTypes.h"
-#include "swift/Frontend/OutputFileMap.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/PointerIntPair.h"
@@ -230,9 +230,17 @@ public:
 class Job {
 public:
   enum class Condition {
+    // There was no information about the previous build (i.e., an input map),
+    // or the map marked this Job as dirty or needing a cascading build.
+    // Be maximally conservative with dependencies.
     Always,
+    // The input changed, or this job was scheduled as non-cascading in the last
+    // build but didn't get to run.
     RunWithoutCascading,
+    // The best case: input didn't change, output exists.
+    // Only run if it depends on some other thing that changed.
     CheckDependencies,
+    // Run no matter what (but may or may not cascade).
     NewlyAdded
   };
 
@@ -352,7 +360,7 @@ public:
   /// contained within this Job; if this job is not a BatchJob, just pass \c
   /// this and the provided \p OSPid back to the Callback.
   virtual void forEachContainedJobAndPID(
-      llvm::sys::ProcessInfo::ProcessId OSPid,
+      llvm::sys::procid_t OSPid,
       llvm::function_ref<void(const Job *, Job::PID)> Callback) const {
     Callback(this, static_cast<Job::PID>(OSPid));
   }
@@ -401,7 +409,7 @@ public:
   /// Call the provided callback for each Job in the batch, passing the
   /// corresponding quasi-PID with each Job.
   void forEachContainedJobAndPID(
-      llvm::sys::ProcessInfo::ProcessId OSPid,
+      llvm::sys::procid_t OSPid,
       llvm::function_ref<void(const Job *, Job::PID)> Callback) const override {
     Job::PID QPid = QuasiPIDBase;
     assert(QPid < 0);

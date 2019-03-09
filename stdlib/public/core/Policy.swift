@@ -2,7 +2,7 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2018 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
 // See https://swift.org/LICENSE.txt for license information
@@ -27,6 +27,17 @@
 ///     }
 @_frozen
 public enum Never {}
+
+extension Never: Error {}
+
+extension Never: Equatable {}
+
+extension Never: Comparable {
+  public static func < (lhs: Never, rhs: Never) -> Bool {
+  }
+}
+
+extension Never: Hashable {}
 
 //===----------------------------------------------------------------------===//
 // Standardized aliases
@@ -96,14 +107,6 @@ public typealias StringLiteralType = String
 //===----------------------------------------------------------------------===//
 // Default types for unconstrained number literals
 //===----------------------------------------------------------------------===//
-// Integer literals are limited to 2048 bits.
-// The intent is to have arbitrary-precision literals, but implementing that
-// requires more work.
-//
-// Rationale: 1024 bits are enough to represent the absolute value of min/max
-// IEEE Binary64, and we need 1 bit to represent the sign.  Instead of using
-// 1025, we use the next round number -- 2048.
-public typealias _MaxBuiltinIntegerType = Builtin.Int2048
 #if !os(Windows) && (arch(i386) || arch(x86_64))
 public typealias _MaxBuiltinFloatType = Builtin.FPIEEE80
 #else
@@ -314,7 +317,6 @@ public typealias AnyClass = AnyObject.Type
 /// - Parameters:
 ///   - lhs: A value to compare.
 ///   - rhs: Another value to compare.
-@inlinable // FIXME(sil-serialize-all)
 @_transparent
 public func ~= <T : Equatable>(a: T, b: T) -> Bool {
   return a == b
@@ -380,7 +382,7 @@ precedencegroup BitwiseShiftPrecedence {
 // Standard postfix operators.
 postfix operator ++
 postfix operator --
-postfix operator ...
+postfix operator ... : Comparable
 
 // Optional<T> unwrapping operator is built into the compiler as a part of
 // postfix expression grammar.
@@ -390,42 +392,42 @@ postfix operator ...
 // Standard prefix operators.
 prefix operator ++
 prefix operator --
-prefix operator !
-prefix operator ~
-prefix operator +
-prefix operator -
-prefix operator ...
-prefix operator ..<
+prefix operator ! : Bool
+prefix operator ~ : BinaryInteger
+prefix operator + : AdditiveArithmetic
+prefix operator - : SignedNumeric
+prefix operator ... : Comparable
+prefix operator ..< : Comparable
 
 // Standard infix operators.
 
 // "Exponentiative"
 
-infix operator  << : BitwiseShiftPrecedence
-infix operator &<< : BitwiseShiftPrecedence
-infix operator  >> : BitwiseShiftPrecedence
-infix operator &>> : BitwiseShiftPrecedence
+infix operator  << : BitwiseShiftPrecedence, BinaryInteger
+infix operator &<< : BitwiseShiftPrecedence, FixedWidthInteger
+infix operator  >> : BitwiseShiftPrecedence, BinaryInteger
+infix operator &>> : BitwiseShiftPrecedence, FixedWidthInteger
 
 // "Multiplicative"
 
-infix operator   * : MultiplicationPrecedence
-infix operator  &* : MultiplicationPrecedence
-infix operator   / : MultiplicationPrecedence
-infix operator   % : MultiplicationPrecedence
-infix operator   & : MultiplicationPrecedence
+infix operator   * : MultiplicationPrecedence, Numeric
+infix operator  &* : MultiplicationPrecedence, FixedWidthInteger
+infix operator   / : MultiplicationPrecedence, BinaryInteger, FloatingPoint
+infix operator   % : MultiplicationPrecedence, BinaryInteger
+infix operator   & : MultiplicationPrecedence, BinaryInteger
 
 // "Additive"
 
-infix operator   + : AdditionPrecedence
-infix operator  &+ : AdditionPrecedence
-infix operator   - : AdditionPrecedence
-infix operator  &- : AdditionPrecedence
-infix operator   | : AdditionPrecedence
-infix operator   ^ : AdditionPrecedence
+infix operator   + : AdditionPrecedence, AdditiveArithmetic, String, Array, Strideable
+infix operator  &+ : AdditionPrecedence, FixedWidthInteger
+infix operator   - : AdditionPrecedence, AdditiveArithmetic, Strideable
+infix operator  &- : AdditionPrecedence, FixedWidthInteger
+infix operator   | : AdditionPrecedence, BinaryInteger
+infix operator   ^ : AdditionPrecedence, BinaryInteger
 
 // FIXME: is this the right precedence level for "..." ?
-infix operator  ... : RangeFormationPrecedence
-infix operator  ..< : RangeFormationPrecedence
+infix operator  ... : RangeFormationPrecedence, Comparable
+infix operator  ..< : RangeFormationPrecedence, Comparable
 
 // The cast operators 'as' and 'is' are hardcoded as if they had the
 // following attributes:
@@ -437,12 +439,12 @@ infix operator ?? : NilCoalescingPrecedence
 
 // "Comparative"
 
-infix operator  <  : ComparisonPrecedence
-infix operator  <= : ComparisonPrecedence
-infix operator  >  : ComparisonPrecedence
-infix operator  >= : ComparisonPrecedence
-infix operator  == : ComparisonPrecedence
-infix operator  != : ComparisonPrecedence
+infix operator  <  : ComparisonPrecedence, Comparable
+infix operator  <= : ComparisonPrecedence, Comparable
+infix operator  >  : ComparisonPrecedence, Comparable
+infix operator  >= : ComparisonPrecedence, Comparable
+infix operator  == : ComparisonPrecedence, Equatable
+infix operator  != : ComparisonPrecedence, Equatable
 infix operator === : ComparisonPrecedence
 infix operator !== : ComparisonPrecedence
 // FIXME: ~= will be built into the compiler.
@@ -450,11 +452,11 @@ infix operator  ~= : ComparisonPrecedence
 
 // "Conjunctive"
 
-infix operator && : LogicalConjunctionPrecedence
+infix operator && : LogicalConjunctionPrecedence, Bool
 
 // "Disjunctive"
 
-infix operator || : LogicalDisjunctionPrecedence
+infix operator || : LogicalDisjunctionPrecedence, Bool
 
 // User-defined ternary operators are not supported. The ? : operator is
 // hardcoded as if it had the following attributes:
@@ -466,21 +468,21 @@ infix operator || : LogicalDisjunctionPrecedence
 
 // Compound
 
-infix operator   *= : AssignmentPrecedence
-infix operator  &*= : AssignmentPrecedence
-infix operator   /= : AssignmentPrecedence
-infix operator   %= : AssignmentPrecedence
-infix operator   += : AssignmentPrecedence
-infix operator  &+= : AssignmentPrecedence
-infix operator   -= : AssignmentPrecedence
-infix operator  &-= : AssignmentPrecedence
-infix operator  <<= : AssignmentPrecedence
-infix operator &<<= : AssignmentPrecedence
-infix operator  >>= : AssignmentPrecedence
-infix operator &>>= : AssignmentPrecedence
-infix operator   &= : AssignmentPrecedence
-infix operator   ^= : AssignmentPrecedence
-infix operator   |= : AssignmentPrecedence
+infix operator   *= : AssignmentPrecedence, Numeric
+infix operator  &*= : AssignmentPrecedence, FixedWidthInteger
+infix operator   /= : AssignmentPrecedence, BinaryInteger
+infix operator   %= : AssignmentPrecedence, BinaryInteger
+infix operator   += : AssignmentPrecedence, AdditiveArithmetic, String, Array, Strideable
+infix operator  &+= : AssignmentPrecedence, FixedWidthInteger
+infix operator   -= : AssignmentPrecedence, AdditiveArithmetic, Strideable
+infix operator  &-= : AssignmentPrecedence, FixedWidthInteger
+infix operator  <<= : AssignmentPrecedence, BinaryInteger
+infix operator &<<= : AssignmentPrecedence, FixedWidthInteger
+infix operator  >>= : AssignmentPrecedence, BinaryInteger
+infix operator &>>= : AssignmentPrecedence, FixedWidthInteger
+infix operator   &= : AssignmentPrecedence, BinaryInteger
+infix operator   ^= : AssignmentPrecedence, BinaryInteger
+infix operator   |= : AssignmentPrecedence, BinaryInteger
 
 // Workaround for <rdar://problem/14011860> SubTLF: Default
 // implementations in protocols.  Library authors should ensure

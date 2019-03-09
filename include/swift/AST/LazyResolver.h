@@ -53,11 +53,6 @@ public:
   virtual void resolveWitness(const NormalProtocolConformance *conformance,
                               ValueDecl *requirement) = 0;
 
-  /// Resolve the access of a value.
-  ///
-  /// It does no type-checking.
-  virtual void resolveAccessControl(ValueDecl *VD) = 0;
-
   /// Resolve the type and declaration attributes of a value.
   ///
   /// This can be called when the type or signature of a value is needed.
@@ -65,33 +60,14 @@ public:
   /// consistency and provides the value a type.
   virtual void resolveDeclSignature(ValueDecl *VD) = 0;
 
-  /// Resolve the "overridden" declaration of the given declaration.
-  virtual void resolveOverriddenDecl(ValueDecl *VD) = 0;
-
-  /// Resolve the "is Objective-C" bit for the given declaration.
-  virtual void resolveIsObjC(ValueDecl *VD) = 0;
-
-  /// Resolve the trailing where clause of the given protocol in-place.
-  virtual void resolveTrailingWhereClause(ProtocolDecl *proto) = 0;
-
-  /// Bind an extension to its extended type.
-  virtual void bindExtension(ExtensionDecl *ext) = 0;
+  /// Resolve the generic environment of the given protocol.
+  virtual void resolveProtocolEnvironment(ProtocolDecl *proto) = 0;
 
   /// Resolve the type of an extension.
   ///
   /// This can be called to ensure that the members of an extension can be
   /// considered to be members of the extended type.
   virtual void resolveExtension(ExtensionDecl *ext) = 0;
-
-  using ConformanceConstructionInfo = std::pair<SourceLoc, ProtocolDecl *>;
-  /// Resolve enough of an extension to find which protocols it is declaring
-  /// conformance to.
-  ///
-  /// This can be called to ensure that the "extension Foo: Bar, Baz" part of
-  /// the extension is understood.
-  virtual void resolveExtensionForConformanceConstruction(
-      ExtensionDecl *ext,
-      SmallVectorImpl<ConformanceConstructionInfo> &protocols) = 0;
 
   /// Resolve any implicitly-declared constructors within the given nominal.
   virtual void resolveImplicitConstructors(NominalTypeDecl *nominal) = 0;
@@ -102,6 +78,10 @@ public:
   /// Mark the given conformance as "used" from the given declaration context.
   virtual void markConformanceUsed(ProtocolConformanceRef conformance,
                                    DeclContext *dc) = 0;
+
+  /// Fill in the signature conformances of the given protocol conformance.
+  virtual void checkConformanceRequirements(
+                                    NormalProtocolConformance *conformance) = 0;
 };
 
 class LazyMemberLoader;
@@ -111,6 +91,23 @@ class LazyContextData {
 public:
   /// The lazy member loader for this context.
   LazyMemberLoader *loader;
+};
+
+/// A class that can lazily parse members for an iterable decl context.
+class LazyMemberParser {
+public:
+  virtual ~LazyMemberParser() = default;
+
+  /// Populates a given decl context \p IDC with all of its members.
+  ///
+  /// The implementation should add the members to IDC.
+  virtual void parseMembers(IterableDeclContext *IDC) = 0;
+
+  /// Return whether the iterable decl context needs parsing.
+  virtual bool hasUnparsedMembers(const IterableDeclContext *IDC) = 0;
+
+  /// Parse all delayed decl list members.
+  virtual void parseAllDelayedDeclLists() = 0;
 };
 
 /// Context data for generic contexts.

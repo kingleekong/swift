@@ -13,6 +13,7 @@
 #include "swift/Index/IndexSymbol.h"
 #include "swift/AST/ASTContext.h"
 #include "swift/AST/Decl.h"
+#include "swift/AST/Module.h"
 #include "swift/AST/ParameterList.h"
 #include "swift/AST/Types.h"
 
@@ -20,7 +21,7 @@ using namespace swift;
 using namespace swift::index;
 
 static NominalTypeDecl *getNominalParent(const ValueDecl *D) {
-  return D->getDeclContext()->getAsNominalTypeOrNominalTypeExtensionContext();
+  return D->getDeclContext()->getSelfNominalTypeDecl();
 }
 
 /// \returns true if \c D is a subclass of 'XCTestCase'.
@@ -62,9 +63,7 @@ static bool isUnitTest(const ValueDecl *D) {
     return false;
 
   // 4. ...takes no parameters...
-  if (FD->getParameterLists().size() != 2)
-    return false;
-  if (FD->getParameterList(1)->size() != 0)
+  if (FD->getParameters()->size() != 0)
     return false;
 
   // 5. ...is of at least 'internal' access (unless we can use
@@ -136,6 +135,25 @@ static SymbolKind getVarSymbolKind(const VarDecl *VD) {
   return SymbolKind::Variable;
 }
 
+SymbolInfo index::getSymbolInfoForModule(ModuleEntity Mod) {
+  SymbolInfo info;
+  info.Kind = SymbolKind::Module;
+  info.SubKind = SymbolSubKind::None;
+  info.Properties = SymbolPropertySet();
+  if (auto *D = Mod.getAsSwiftModule()) {
+    if (!D->isClangModule()) {
+      info.Lang = SymbolLanguage::Swift;
+    } else {
+      info.Lang = SymbolLanguage::C;
+    }
+  } else if (Mod.getAsClangModule()) {
+    info.Lang = SymbolLanguage::C;
+  } else {
+    llvm_unreachable("unexpected module kind");
+  }
+  return info;
+}
+
 SymbolInfo index::getSymbolInfoForDecl(const Decl *D) {
   SymbolInfo info{ SymbolKind::Unknown, SymbolSubKind::None,
                    SymbolLanguage::Swift, SymbolPropertySet() };
@@ -151,9 +169,7 @@ SymbolInfo index::getSymbolInfoForDecl(const Decl *D) {
     case DeclKind::Extension: {
       info.Kind = SymbolKind::Extension;
       auto *ED = cast<ExtensionDecl>(D);
-      if (!ED->getExtendedType())
-        break;
-      NominalTypeDecl *NTD = ED->getExtendedType()->getAnyNominal();
+      NominalTypeDecl *NTD = ED->getExtendedNominal();
       if (!NTD)
         break;
       if (isa<StructDecl>(NTD))
@@ -236,8 +252,8 @@ SymbolSubKind index::getSubKindForAccessor(AccessorKind AK) {
   case AccessorKind::Address: return SymbolSubKind::SwiftAccessorAddressor;
   case AccessorKind::MutableAddress:
     return SymbolSubKind::SwiftAccessorMutableAddressor;
-  case AccessorKind::MaterializeForSet:
-    llvm_unreachable("unexpected MaterializeForSet");
+  case AccessorKind::Read:      return SymbolSubKind::SwiftAccessorRead;
+  case AccessorKind::Modify:    return SymbolSubKind::SwiftAccessorModify;
   }
 
   llvm_unreachable("Unhandled AccessorKind in switch.");

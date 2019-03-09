@@ -3,9 +3,7 @@
 // REQUIRES: executable_test
 // REQUIRES: stress_test
 // REQUIRES: tsan_runtime
-
-// https://bugs.swift.org/browse/SR-6622
-// XFAIL: linux
+// UNSUPPORTED: CPU=powerpc64le
 
 // Check that TSan does not report spurious races in witness table lookup.
 

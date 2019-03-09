@@ -197,7 +197,7 @@ public:
       // if (FD->getBodyResultTypeLoc().hasLocation()) {
       //   EndLoc = FD->getBodyResultTypeLoc().getSourceRange().End;
       // } else {
-      //   EndLoc = FD->getParameterLists().back()->getSourceRange().End;
+      //   EndLoc = FD->getParameters()->getSourceRange().End;
       // }
 
       if (StartLoc.isValid() && EndLoc.isValid()) {
@@ -314,7 +314,7 @@ public:
         if (FD->getBodyResultTypeLoc().hasLocation()) {
           EndLoc = FD->getBodyResultTypeLoc().getSourceRange().End;
         } else {
-          EndLoc = FD->getParameterLists().back()->getSourceRange().End;
+          EndLoc = FD->getParameters()->getSourceRange().End;
         }
 
         if (EndLoc.isValid())
@@ -322,7 +322,7 @@ public:
 
         if (NB != B) {
           FD->setBody(NB);
-          TypeChecker(Context).checkFunctionErrorHandling(FD);
+          TypeChecker::createForContext(Context).checkFunctionErrorHandling(FD);
         }
       }
     } else if (auto *NTD = dyn_cast<NominalTypeDecl>(D)) {
@@ -482,8 +482,9 @@ public:
         new (Context) VarDecl(/*IsStatic*/false, VarDecl::Specifier::Let,
                               /*IsCaptureList*/false, SourceLoc(),
                               Context.getIdentifier(NameBuf),
-                              MaybeLoadInitExpr->getType(), TypeCheckDC);
-
+                              TypeCheckDC);
+    VD->setType(MaybeLoadInitExpr->getType());
+    VD->setInterfaceType(MaybeLoadInitExpr->getType()->mapTypeOutOfContext());
     VD->setImplicit();
 
     NamedPattern *NP = new (Context) NamedPattern(VD, /*implicit*/ true);
@@ -667,7 +668,7 @@ void swift::performPCMacro(SourceFile &SF, TopLevelContext &TLC) {
             BraceStmt *NewBody = I.transformBraceStmt(Body, true);
             if (NewBody != Body) {
               TLCD->setBody(NewBody);
-              TypeChecker TC(ctx);
+              TypeChecker &TC = TypeChecker::createForContext(ctx);
               TC.checkTopLevelErrorHandling(TLCD);
               TC.contextualizeTopLevelCode(TLC,
                                            SmallVector<Decl *, 1>(1, TLCD));

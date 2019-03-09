@@ -19,6 +19,7 @@
 #define SWIFT_AST_IRGENOPTIONS_H
 
 #include "swift/AST/LinkLibrary.h"
+#include "swift/Basic/PathRemapper.h"
 #include "swift/Basic/Sanitizers.h"
 #include "swift/Basic/OptionSet.h"
 #include "swift/Basic/OptimizationMode.h"
@@ -109,19 +110,22 @@ public:
   /// What type of debug info to generate.
   IRGenDebugInfoFormat DebugInfoFormat : 2;
 
-  /// \brief Whether we're generating IR for the JIT.
+  /// Path prefixes that should be rewritten in debug info.
+  PathRemapper DebugPrefixMap;
+
+  /// Whether we're generating IR for the JIT.
   unsigned UseJIT : 1;
   
-  /// \brief Whether we're generating code for the integrated REPL.
+  /// Whether we're generating code for the integrated REPL.
   unsigned IntegratedREPL : 1;
   
-  /// \brief Whether we should run LLVM optimizations after IRGen.
+  /// Whether we should run LLVM optimizations after IRGen.
   unsigned DisableLLVMOptzns : 1;
 
   /// Whether we should run swift specific LLVM optimizations after IRGen.
   unsigned DisableSwiftSpecificLLVMOptzns : 1;
 
-  /// \brief Whether we should run LLVM SLP vectorizer.
+  /// Whether we should run LLVM SLP vectorizer.
   unsigned DisableLLVMSLPVectorizer : 1;
 
   /// Disable frame pointer elimination?
@@ -161,11 +165,23 @@ public:
   /// Emit names of struct stored properties and enum cases.
   unsigned EnableReflectionNames : 1;
 
-  /// Enables resilient class layout.
-  unsigned EnableClassResilience : 1;
+  /// Emit mangled names of anonymous context descriptors.
+  unsigned EnableAnonymousContextMangledNames : 1;
 
   /// Bypass resilience when accessing resilient frameworks.
   unsigned EnableResilienceBypass : 1;
+
+  /// Force lazy initialization of class metadata
+  /// Used on Windows to avoid cross-module references.
+  unsigned LazyInitializeClassMetadata : 1;
+
+  /// Normally if the -read-legacy-type-info flag is not specified, we look for
+  /// a file named "legacy-<arch>.yaml" in SearchPathOpts.RuntimeLibraryPath.
+  /// Passing this flag completely disables this behavior.
+  unsigned DisableLegacyTypeInfo : 1;
+
+  /// The path to load legacy type layouts from.
+  StringRef ReadLegacyTypeInfoPath;
 
   /// Should we try to build incrementally by not emitting an object file if it
   /// has the same IR hash as the module that we are preparing to emit?
@@ -180,6 +196,12 @@ public:
   /// Instrument code to generate profiling information.
   unsigned GenerateProfile : 1;
 
+  /// Enable chaining of dynamic replacements.
+  unsigned EnableDynamicReplacementChaining : 1;
+
+  /// Disable round-trip verification of mangled debug types.
+  unsigned DisableRoundTripDebugTypes : 1;
+
   /// Path to the profdata file to be used for PGO, or the empty string.
   std::string UseProfile = "";
 
@@ -188,6 +210,15 @@ public:
 
   /// Which sanitizer coverage is turned on.
   llvm::SanitizerCoverageOptions SanitizeCoverage;
+
+  /// The different modes for dumping IRGen type info.
+  enum class TypeInfoDumpFilter {
+    All,
+    Resilient,
+    Fragile
+  };
+
+  TypeInfoDumpFilter TypeInfoFilter;
 
   IRGenOptions()
       : DWARFVersion(2), OutputKind(IRGenOutputKind::LLVMAssembly),
@@ -201,10 +232,14 @@ public:
         EmitStackPromotionChecks(false), PrintInlineTree(false),
         EmbedMode(IRGenEmbedMode::None), HasValueNamesSetting(false),
         ValueNames(false), EnableReflectionMetadata(true),
-        EnableReflectionNames(true), EnableClassResilience(false),
-        EnableResilienceBypass(false), UseIncrementalLLVMCodeGen(true),
-        UseSwiftCall(false), GenerateProfile(false), CmdArgs(),
-        SanitizeCoverage(llvm::SanitizerCoverageOptions()) {}
+        EnableReflectionNames(true), EnableAnonymousContextMangledNames(false),
+        EnableResilienceBypass(false), LazyInitializeClassMetadata(false),
+        DisableLegacyTypeInfo(false),
+        UseIncrementalLLVMCodeGen(true), UseSwiftCall(false),
+        GenerateProfile(false), EnableDynamicReplacementChaining(false),
+        DisableRoundTripDebugTypes(false),
+        CmdArgs(), SanitizeCoverage(llvm::SanitizerCoverageOptions()),
+        TypeInfoFilter(TypeInfoDumpFilter::All) {}
 
   // Get a hash of all options which influence the llvm compilation but are not
   // reflected in the llvm module itself.

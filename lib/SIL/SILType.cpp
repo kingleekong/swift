@@ -42,6 +42,10 @@ SILType SILType::getRawPointerType(const ASTContext &C) {
   return getPrimitiveObjectType(C.TheRawPointerType);
 }
 
+SILType SILType::getBuiltinIntegerLiteralType(const ASTContext &C) {
+  return getPrimitiveObjectType(C.TheIntegerLiteralType);
+}
+
 SILType SILType::getBuiltinIntegerType(unsigned bitWidth,
                                        const ASTContext &C) {
   return getPrimitiveObjectType(CanType(BuiltinIntegerType::get(bitWidth, C)));
@@ -77,11 +81,21 @@ SILType SILType::getSILTokenType(const ASTContext &C) {
 }
 
 bool SILType::isTrivial(SILModule &M) const {
-  return M.getTypeLowering(*this).isTrivial();
+  return M.Types.getTypeLowering(*this,
+                                 ResilienceExpansion::Minimal)
+    .isTrivial();
+}
+
+bool SILType::isTrivial(const SILFunction &F) const {
+  // FIXME: Should just call F.getTypeLowering()
+  return F.getModule().Types.getTypeLowering(*this,
+                                       F.getResilienceExpansion()).isTrivial();
 }
 
 bool SILType::isReferenceCounted(SILModule &M) const {
-  return M.getTypeLowering(*this).isReferenceCounted();
+  return M.Types.getTypeLowering(*this,
+                                 ResilienceExpansion::Minimal)
+    .isReferenceCounted();
 }
 
 bool SILType::isNoReturnFunction() const {
@@ -134,11 +148,12 @@ SILType SILType::getFieldType(VarDecl *field, SILModule &M) const {
       baseTy->getTypeOfMember(M.getSwiftModule(),
                               field, nullptr)->getCanonicalType();
   }
-  auto loweredTy = M.Types.getLoweredType(origFieldTy, substFieldTy);
+
+  auto loweredTy = M.Types.getLoweredRValueType(origFieldTy, substFieldTy);
   if (isAddress() || getClassOrBoundGenericClass() != nullptr) {
-    return loweredTy.getAddressType();
+    return SILType::getPrimitiveAddressType(loweredTy);
   } else {
-    return loweredTy.getObjectType();
+    return SILType::getPrimitiveObjectType(loweredTy);
   }
 }
 
@@ -162,20 +177,34 @@ SILType SILType::getEnumElementType(EnumElementDecl *elt, SILModule &M) const {
     getASTType()->getTypeOfMember(M.getSwiftModule(), elt,
                                           elt->getArgumentInterfaceType());
   auto loweredTy =
-    M.Types.getLoweredType(M.Types.getAbstractionPattern(elt), substEltTy);
+    M.Types.getLoweredRValueType(M.Types.getAbstractionPattern(elt),
+                                 substEltTy);
 
-  return SILType(loweredTy.getASTType(), getCategory());
+  return SILType(loweredTy, getCategory());
 }
 
 bool SILType::isLoadableOrOpaque(SILModule &M) const {
   return isLoadable(M) || !SILModuleConventions(M).useLoweredAddresses();
 }
 
+bool SILType::isLoadableOrOpaque(const SILFunction &F) const {
+  SILModule &M = F.getModule();
+  return isLoadable(F) ||
+         !SILModuleConventions(M).useLoweredAddresses();
+}
+
 /// True if the type, or the referenced type of an address type, is
 /// address-only. For example, it could be a resilient struct or something of
 /// unknown size.
 bool SILType::isAddressOnly(SILModule &M) const {
-  return M.getTypeLowering(*this).isAddressOnly();
+  return M.Types.getTypeLowering(*this, ResilienceExpansion::Minimal)
+    .isAddressOnly();
+}
+
+bool SILType::isAddressOnly(const SILFunction &F) const {
+  // FIXME: Should just call F.getTypeLowering()
+  return F.getModule().Types.getTypeLowering(*this,
+                                   F.getResilienceExpansion()).isAddressOnly();
 }
 
 SILType SILType::substGenericArgs(SILModule &M,
@@ -199,17 +228,6 @@ bool SILType::isHeapObjectReferenceType() const {
   if (is<SILBoxType>())
     return true;
   return false;
-}
-
-SILType SILType::getMetatypeInstanceType(SILModule &M) const {
-  CanType MetatypeType = getASTType();
-  assert(MetatypeType->is<AnyMetatypeType>() &&
-         "This method should only be called on SILTypes with an underlying "
-         "metatype type.");
-  Type instanceType =
-    MetatypeType->castTo<AnyMetatypeType>()->getInstanceType();
-
-  return M.Types.getLoweredType(instanceType->getCanonicalType());
 }
 
 bool SILType::aggregateContainsRecord(SILType Record, SILModule &Mod) const {
@@ -356,20 +374,22 @@ SILType::canUseExistentialRepresentation(SILModule &M,
 
     auto layout = getASTType().getExistentialLayout();
 
+    switch (layout.getKind()) {
+    // A class-constrained composition uses ClassReference representation;
+    // otherwise, we use a fixed-sized buffer.
+    case ExistentialLayout::Kind::Class:
+      return repr == ExistentialRepresentation::Class;
     // The (uncomposed) Error existential uses a special boxed
-    // representation. It can also adopt class references of bridged error types
-    // directly.
-    if (layout.isErrorExistential())
+    // representation. It can also adopt class references of bridged
+    // error types directly.
+    case ExistentialLayout::Kind::Error:
       return repr == ExistentialRepresentation::Boxed
         || (repr == ExistentialRepresentation::Class
             && isBridgedErrorClass(M, containedType));
-    
-    // A class-constrained composition uses ClassReference representation;
-    // otherwise, we use a fixed-sized buffer.
-    if (layout.requiresClass())
-      return repr == ExistentialRepresentation::Class;
-
-    return repr == ExistentialRepresentation::Opaque;
+    case ExistentialLayout::Kind::Opaque:
+      return repr == ExistentialRepresentation::Opaque;
+    }
+    llvm_unreachable("unknown existential kind!");
   }
   case ExistentialRepresentation::Metatype:
     return is<ExistentialMetatypeType>();
@@ -378,9 +398,10 @@ SILType::canUseExistentialRepresentation(SILModule &M,
   llvm_unreachable("Unhandled ExistentialRepresentation in switch.");
 }
 
-SILType SILType::getReferentType(SILModule &M) const {
-  auto Ty = castTo<ReferenceStorageType>();
-  return M.Types.getLoweredType(Ty->getReferentType()->getCanonicalType());
+SILType SILType::mapTypeOutOfContext() const {
+  return SILType::getPrimitiveType(getASTType()->mapTypeOutOfContext()
+                                               ->getCanonicalType(),
+                                   getCategory());
 }
 
 CanType
@@ -400,6 +421,7 @@ SILBoxType::getFieldLoweredType(SILModule &M, unsigned index) const {
   return fieldTy;
 }
 
+// FIXME: This should take a SILFunction, or a SILModule + ResilienceExpansion
 ValueOwnershipKind
 SILResultInfo::getOwnershipKind(SILModule &M,
                                 CanGenericSignature signature) const {
@@ -408,7 +430,7 @@ SILResultInfo::getOwnershipKind(SILModule &M,
   switch (getConvention()) {
   case ResultConvention::Indirect:
     return SILModuleConventions(M).isSILIndirect(*this)
-               ? ValueOwnershipKind::Trivial
+               ? ValueOwnershipKind::Any
                : ValueOwnershipKind::Owned;
   case ResultConvention::Autoreleased:
   case ResultConvention::Owned:
@@ -416,7 +438,7 @@ SILResultInfo::getOwnershipKind(SILModule &M,
   case ResultConvention::Unowned:
   case ResultConvention::UnownedInnerPointer:
     if (IsTrivial)
-      return ValueOwnershipKind::Trivial;
+      return ValueOwnershipKind::Any;
     return ValueOwnershipKind::Unowned;
   }
 
@@ -533,8 +555,7 @@ bool SILType::hasAbstractionDifference(SILFunctionTypeRepresentation rep,
 bool SILType::isLoweringOf(SILModule &Mod, CanType formalType) {
   SILType loweredType = *this;
 
-  // Optional lowers its contained type. The difference between Optional
-  // and IUO is lowered away.
+  // Optional lowers its contained type.
   SILType loweredObjectType = loweredType.getOptionalObjectType();
   CanType formalObjectType = formalType.getOptionalObjectType();
 
@@ -544,10 +565,9 @@ bool SILType::isLoweringOf(SILModule &Mod, CanType formalType) {
   }
 
   // Metatypes preserve their instance type through lowering.
-  if (loweredType.is<MetatypeType>()) {
+  if (auto loweredMT = loweredType.getAs<MetatypeType>()) {
     if (auto formalMT = dyn_cast<MetatypeType>(formalType)) {
-      return loweredType.getMetatypeInstanceType(Mod).isLoweringOf(
-          Mod, formalMT.getInstanceType());
+      return loweredMT.getInstanceType() == formalMT.getInstanceType();
     }
   }
 
